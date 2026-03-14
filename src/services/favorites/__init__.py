@@ -1,1 +1,0 @@
-"""Favorite activity management."""

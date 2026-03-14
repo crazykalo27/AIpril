@@ -1,17 +1,7 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-*.egg-info/
-dist/
-build/
-*.egg
-
-# Virtual environments
-venv/
-.venv/
-env/
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
 
 # IDE
 .vscode/
@@ -19,25 +9,20 @@ env/
 *.swp
 *.swo
 
-# Environment
-.env
+# Secrets (NEVER commit)
+include/secrets.h
 credentials.json
 token.json
-token.pickle
 
-# Audio data
-data/audio/
-data/metadata/
+# Build artifacts
+build/
+*.o
+*.elf
+*.bin
 
 # OS
 .DS_Store
 Thumbs.db
 
 # Logs
-logs/
 *.log
-
-# Testing
-.pytest_cache/
-htmlcov/
-.coverage

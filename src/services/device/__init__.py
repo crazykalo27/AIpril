@@ -1,1 +1,0 @@
-"""Hardware device communication services."""

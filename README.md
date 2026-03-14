@@ -1,79 +1,132 @@
-# AIpril — Productivity Prompt Device
+# AIpril — Voice-to-Calendar ESP32 Device
 
-A Python application that periodically prompts the user to log what they are doing,
-records their voice response, interprets it with AI, and integrates with Google Calendar.
-Designed to work alongside an ESP32 hardware device.
+ESP32 firmware that records what you're doing via microphone,
+transcribes and interprets it with OpenAI, and creates a Google Calendar event.
 
-## Architecture Overview
+## MVP Flow
 
-The project follows a **layered service-oriented architecture**:
+```
+[User speaks] → [I2S mic] → [WAV buffer]
+    → [POST multipart to OpenAI /v1/audio/transcriptions] → transcript
+    → [POST JSON to OpenAI /v1/chat/completions] → event name
+    → [POST to Google Calendar API] → event created
+```
 
-| Layer | Purpose |
-|---|---|
-| `domain/` | Pure data models and enums — no external dependencies |
-| `services/` | Business logic services (calendar, audio, transcription, etc.) |
-| `application/` | Orchestrators and use cases that compose services |
-| `infrastructure/` | External API integrations (Google, OpenAI, file storage) |
-| `interfaces/` | User-facing entry points (CLI for now) |
-| `config/` | Settings, logging, constants |
-| `utils/` | Small focused helpers |
+**Two-call approach** (memory-efficient for ESP32):
+1. Multipart POST raw WAV bytes → transcript (no base64 overhead)
+2. JSON POST transcript text → structured event name
 
-### Core Flows
-
-- **Schedule Decision**: Check calendar → detect reclaim blocks → decide whether to prompt
-- **User Input Capture**: Prompt → record voice / button press → transcribe → interpret → store
-- **ESP32 Sync**: Simplify calendar into timestamp blocks → serialize for device
-- **Data Management**: Store/index/delete audio files and metadata
-
-## Directory Structure
+## Architecture
 
 ```
 src/
-├── main.py                     # CLI entrypoint
-├── app/                        # Bootstrap and DI container
-├── config/                     # Settings, logging, constants
+├── main.cpp                              # setup() + loop()
+├── app/
+│   ├── app_controller.h/cpp              # Top-level orchestrator
+├── config/
+│   ├── config.h                          # Central compile-time config
+│   └── wifi_manager.h/cpp                # WiFi connection
 ├── domain/
-│   ├── models/                 # Pydantic data models
-│   └── enums/                  # State and type enumerations
-├── application/
-│   ├── orchestrators/          # High-level flow coordinators
-│   └── use_cases/              # Single-responsibility actions
+│   ├── models.h                          # CalendarEvent, VoiceRecord, etc.
+│   └── enums.h                           # PromptState, InputSource
 ├── services/
-│   ├── calendar/               # Reclaim detection, schedule simplification
-│   ├── audio/                  # Recording, playback, storage
-│   ├── transcription/          # Speech-to-text abstraction
-│   ├── interpretation/         # AI activity classification
-│   ├── device/                 # ESP32 export
-│   ├── input/                  # Button handling
-│   ├── favorites/              # Saved favorite activities
-│   ├── repeat/                 # Repeat-last-activity logic
-│   └── network/                # Connectivity checks
+│   ├── audio/
+│   │   ├── i2s_recorder.h/cpp            # INMP441 I2S mic → WAV
+│   │   └── buzzer.h/cpp                  # Beep/tone feedback
+│   ├── calendar/
+│   │   ├── reclaim_detector.h/cpp        # [reclaim] tag detection
+│   │   └── schedule_builder.h/cpp        # Events → schedule blocks
+│   ├── input/
+│   │   └── button_handler.h/cpp          # Debounced button input
+│   └── prompt/
+│       └── prompt_scheduler.h/cpp        # Interval-based prompting
 ├── infrastructure/
-│   ├── google/                 # Google Auth + Calendar API client
-│   ├── openai/                 # OpenAI transcription + parsing
-│   └── persistence/            # Local file and metadata storage
-├── interfaces/
-│   └── cli/                    # CLI commands and menus
-└── utils/                      # Datetime helpers, ID generation
-tests/                          # Unit and integration tests
+│   ├── network/
+│   │   └── https_client.h/cpp            # TLS HTTP client
+│   ├── google/
+│   │   ├── google_auth.h/cpp             # OAuth2 token refresh
+│   │   └── google_calendar.h/cpp         # Calendar API
+│   ├── openai/
+│   │   ├── openai_transcriber.h/cpp      # Whisper transcription
+│   │   └── openai_interpreter.h/cpp      # GPT event extraction
+│   └── storage/
+│       └── nvs_store.h/cpp               # NVS key-value persistence
+└── utils/
+    ├── time_utils.h/cpp                  # RFC3339 formatting, NTP
+    └── json_helpers.h                    # ArduinoJson wrappers
+
+include/
+├── pins.h                                # Hardware pin assignments
+└── secrets.h.example                     # API key template
+
+tools/
+└── google_auth_setup.py                  # One-time OAuth setup (run on PC)
+
+test/
+└── test_main.cpp                         # PlatformIO unit tests
 ```
 
 ## Setup
 
-1. Clone the repository
-2. Create a virtual environment: `python -m venv venv`
-3. Activate it: `venv\Scripts\activate` (Windows) or `source venv/bin/activate` (Unix)
-4. Install dependencies: `pip install -r requirements.txt`
-5. Copy `.env.example` to `.env` and fill in your API keys
-6. Set up Google Calendar credentials (see Google API Console)
-7. Run: `python src/main.py`
+### 1. Google OAuth (run once on PC)
+
+```bash
+pip install google-auth-oauthlib
+# Download credentials.json from Google Cloud Console
+python tools/google_auth_setup.py
+# Copy the refresh token
+```
+
+### 2. Configure secrets
+
+```bash
+cp include/secrets.h.example include/secrets.h
+# Edit: WiFi SSID/password, OpenAI key, Google client ID/secret
+# Optionally paste the refresh token as GOOGLE_REFRESH_TOKEN
+```
+
+### 3. Wiring (INMP441 mic)
+
+| INMP441 | ESP32 |
+|---------|-------|
+| BCLK    | GPIO 26 |
+| LRCK    | GPIO 25 |
+| DIN     | GPIO 33 |
+| GND     | GND |
+| VDD     | 3.3V |
+
+Buzzer → GPIO 27. Buttons → GPIO 0, 32, 35 (with internal pullups).
+
+### 4. Build & Upload
+
+```bash
+# PlatformIO CLI
+pio run -t upload
+pio device monitor
+```
+
+Or open in PlatformIO IDE (VS Code extension).
+
+### 5. Send refresh token via serial (if not in secrets.h)
+
+```
+set_token 1//your-refresh-token-here
+```
+
+## Serial Commands
+
+| Command | Description |
+|---------|-------------|
+| `record` | Manually trigger voice capture |
+| `status` | Show WiFi, auth, and time status |
+| `set_token <token>` | Store Google refresh token in NVS |
+| `help` | List commands |
 
 ## Future Work
 
-- Full Google Calendar OAuth flow
-- OpenAI Whisper transcription integration
-- ESP32 serial communication
-- Hardware button input via serial/BLE
-- Web dashboard for reviewing logged activities
+- HTTPS certificate validation (currently uses `setInsecure()`)
+- Configurable favorites via serial/NVS
+- Reclaim-aware prompt suppression from live calendar
 - Sleep/focus mode scheduling rules
-- Multi-user support
+- LED status indicators
+- OTA firmware updates

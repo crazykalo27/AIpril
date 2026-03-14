@@ -1,1 +1,0 @@
-"""Calendar-related business logic."""
