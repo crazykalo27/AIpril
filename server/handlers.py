@@ -37,21 +37,38 @@ def handle_transcribe(audio_b64: str) -> dict:
     return {"ok": True, "transcript": text}
 
 
+def _ext_from_mime(content_type: str) -> str:
+    """Map browser MIME type to a file extension OpenAI accepts."""
+    ct = content_type.lower()
+    if "webm" in ct:
+        return "webm"
+    if "ogg" in ct:
+        return "ogg"
+    if "mp4" in ct or "m4a" in ct:
+        return "m4a"
+    if "mpeg" in ct or "mp3" in ct:
+        return "mp3"
+    return "webm"
+
+
 def handle_transcribe_bytes(audio_bytes: bytes, content_type: str = "") -> dict:
-    """Transcribe raw audio bytes (webm, wav, etc.) via OpenAI."""
+    """Transcribe raw audio bytes (webm, wav, ogg, etc.) via OpenAI."""
     if not OPENAI_API_KEY:
         return {"ok": False, "error": "OPENAI_API_KEY not set"}
 
-    ext = "webm" if "webm" in content_type else "wav"
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    with BytesIO(audio_bytes) as f:
-        f.name = f"recording.{ext}"
-        transcript = client.audio.transcriptions.create(
-            model=OPENAI_TRANSCRIBE_MODEL,
-            file=f,
-        )
-    text = transcript.text if transcript.text else ""
-    return {"ok": True, "transcript": text}
+    ext = _ext_from_mime(content_type)
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        with BytesIO(audio_bytes) as f:
+            f.name = f"recording.{ext}"
+            transcript = client.audio.transcriptions.create(
+                model=OPENAI_TRANSCRIBE_MODEL,
+                file=f,
+            )
+        text = transcript.text if transcript.text else ""
+        return {"ok": True, "transcript": text}
+    except Exception as e:
+        return {"ok": False, "error": f"STT error: {e}"}
 
 
 def handle_interpret(transcript: str) -> dict:
