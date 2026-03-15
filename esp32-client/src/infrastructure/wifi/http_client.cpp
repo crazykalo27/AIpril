@@ -140,6 +140,26 @@ HttpResponse HttpClient::postFavorite() {
     return parseJson(body);
 }
 
+bool HttpClient::postRemoteRecord(bool start) {
+    HTTPClient http;
+    String url = _serverUrl + "/api/esp32/remote_record";
+    if (!http.begin(url)) {
+        _registered = false;
+        return false;
+    }
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(3000);
+    String payload = start ? "{\"action\":\"start\"}" : "{\"action\":\"stop\"}";
+    int code = http.POST(payload);
+    http.end();
+    if (code <= 0) {
+        _registered = false;
+        return false;
+    }
+    Serial.printf("[HTTP] Remote record %s: %d\n", start ? "START" : "STOP", code);
+    return code == 200;
+}
+
 HttpResponse HttpClient::parseJson(const String& body) {
     HttpResponse r = {false, "", "", "", "", ""};
 

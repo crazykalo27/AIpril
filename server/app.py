@@ -55,6 +55,9 @@ _pong_event = threading.Event()
 _expecting_echo = False
 _echo_event = threading.Event()
 
+# Remote record state (ESP32 button triggers computer mic)
+_remote_recording = False
+
 # Debug log buffer (last 100 entries) — source: browser|esp32_wifi|serial
 _debug_log: list[str] = []
 _DEBUG_LOG_MAX = 100
@@ -774,6 +777,63 @@ PAGE_HTML = """
       if (Array.isArray(entries)) entries.forEach(log);
     }
 
+    /* ---- Remote record (ESP32 button → computer mic) ---- */
+
+    let remoteWasRecording = false;
+    let remoteStream = null;
+
+    function startRemoteRecord() {
+      if (mediaRecorder && mediaRecorder.state === 'recording') return;
+      $('log').textContent = '';
+      setStatus('Recording (ESP32 button)...');
+      $('recordBtn').classList.add('recording');
+      log('ESP32 button held — starting mic...');
+
+      navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+        remoteStream = stream;
+        audioChunks = [];
+        mediaRecorder = new MediaRecorder(stream);
+        mediaRecorder.ondataavailable = ev => { if (ev.data.size) audioChunks.push(ev.data); };
+        mediaRecorder.onstop = () => {
+          stream.getTracks().forEach(t => t.stop());
+          remoteStream = null;
+          $('recordBtn').classList.remove('recording');
+          const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+          log('Recording stopped (' + blob.size + ' bytes). Sending to server...');
+          sendToEsp32(blob);
+        };
+        mediaRecorder.start();
+        recordStartTime = new Date().toISOString();
+        log('Recording from computer mic (ESP32 button held)...');
+      }).catch(err => {
+        $('recordBtn').classList.remove('recording');
+        setStatus('Mic error: ' + err.message);
+        log('getUserMedia error: ' + err);
+      });
+    }
+
+    function stopRemoteRecord() {
+      if (!mediaRecorder || mediaRecorder.state !== 'recording') return;
+      log('ESP32 button released — stopping mic...');
+      mediaRecorder.stop();
+    }
+
+    async function pollRemoteRecord() {
+      try {
+        const r = await fetch('/api/remote_record/status');
+        const d = await r.json();
+        if (d.recording && !remoteWasRecording) {
+          remoteWasRecording = true;
+          startRemoteRecord();
+        } else if (!d.recording && remoteWasRecording) {
+          remoteWasRecording = false;
+          stopRemoteRecord();
+        }
+      } catch (_) {}
+    }
+
+    setInterval(pollRemoteRecord, 250);
+
     let debugLogPollTimer = null;
     async function fetchServerDebugLog() {
       try {
@@ -1391,6 +1451,30 @@ def api_esp32_register():
     _update_esp32_wifi(ip)
     _debug(f"Register: ESP32 POST from {ip} (WiFi) — stored as ESP32 IP", src)
     return jsonify({"ok": True})
+
+
+@app.route("/api/esp32/remote_record", methods=["POST"])
+def api_esp32_remote_record():
+    """ESP32 button held/released → set remote recording state for browser."""
+    global _remote_recording
+    data = request.get_json(silent=True) or {}
+    action = data.get("action", "")
+    _update_esp32_wifi(request.remote_addr)
+    if action == "start":
+        _remote_recording = True
+        _debug("Remote record: START (ESP32 button held)", "esp32_wifi")
+    elif action == "stop":
+        _remote_recording = False
+        _debug("Remote record: STOP (ESP32 button released)", "esp32_wifi")
+    else:
+        return jsonify({"ok": False, "error": "action must be start or stop"}), 400
+    return jsonify({"ok": True, "recording": _remote_recording})
+
+
+@app.route("/api/remote_record/status")
+def api_remote_record_status():
+    """Browser polls this to know if ESP32 button is being held."""
+    return jsonify({"recording": _remote_recording})
 
 
 @app.route("/api/esp32/record", methods=["POST"])

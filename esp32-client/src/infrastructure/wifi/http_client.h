@@ -34,6 +34,9 @@ public:
     /// POST to /api/trigger/favorite (server logs favorite).
     HttpResponse postFavorite();
 
+    /// Tell server to start/stop recording from the computer mic.
+    bool postRemoteRecord(bool start);
+
     bool isRegistered() const { return _registered; }
 
 private:

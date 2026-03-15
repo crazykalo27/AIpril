@@ -48,6 +48,11 @@ private:
 
     String _lastEventName;
     bool   _hasLastActivity = false;
+
+    bool _remoteRecording = false;
+    bool _remoteLastState = HIGH;
+    unsigned long _remoteLastChange = 0;
+    void updateRemoteButton();
 };
 
 #endif

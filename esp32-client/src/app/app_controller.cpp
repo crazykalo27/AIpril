@@ -11,7 +11,7 @@
 
 AppController::AppController()
     : _buzzer(PIN_BUZZER)
-    , _buttons(PIN_BTN_VOICE, PIN_BTN_VOICE2, PIN_BTN_REPEAT, PIN_BTN_FAVORITE)
+    , _buttons(PIN_BTN_VOICE, PIN_BTN_REPEAT, PIN_BTN_FAVORITE)
     , _scheduler(PROMPT_INTERVAL_MS)
     , _reclaimDetector(RECLAIM_TAG)
     , _webServer(80)
@@ -62,6 +62,11 @@ void AppController::begin() {
     ledcAttachPin(PIN_PING_SPEAKER, PING_BEEP_CHANNEL);
     ledcWrite(PING_BEEP_CHANNEL, 0);
 
+    pinMode(PIN_BTN_VOICE2, INPUT_PULLUP);
+    delay(5);
+    _remoteLastState = digitalRead(PIN_BTN_VOICE2);
+    Serial.printf("[Btn] remote(GPIO%d)=%s\n", PIN_BTN_VOICE2, _remoteLastState ? "HIGH" : "LOW");
+
     if (WiFi.status() == WL_CONNECTED) {
         setupWebServer();
     }
@@ -74,6 +79,7 @@ void AppController::update() {
     _http.update();
     _webServer.handleClient();
     _buttons.update();
+    updateRemoteButton();
 
     if (_buttons.wasVoicePressed()) {
         handleVoiceCapture();
@@ -172,6 +178,28 @@ void AppController::handleRepeat() {
 
     delay(1000);
     digitalWrite(PIN_LED_REPEAT, LOW);
+}
+
+// ---------------------------------------------------------------------------
+// Remote record: GPIO19 hold → tell server to start/stop computer mic
+// ---------------------------------------------------------------------------
+void AppController::updateRemoteButton() {
+    bool state = digitalRead(PIN_BTN_VOICE2);
+    if (state == _remoteLastState) return;
+    if (millis() - _remoteLastChange < 50) return;
+
+    _remoteLastChange = millis();
+    _remoteLastState = state;
+
+    if (state == LOW && !_remoteRecording) {
+        Serial.println("[Btn] GPIO19 held → remote record START");
+        _remoteRecording = true;
+        _http.postRemoteRecord(true);
+    } else if (state == HIGH && _remoteRecording) {
+        Serial.println("[Btn] GPIO19 released → remote record STOP");
+        _remoteRecording = false;
+        _http.postRemoteRecord(false);
+    }
 }
 
 // ---------------------------------------------------------------------------

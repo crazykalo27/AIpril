@@ -154,5 +154,9 @@ Conceptual notes on changes and project status.
 
 **Changes**:
 - GPIO 19: INPUT_PULLUP, second voice/record button (to GND)
-- Either GPIO 0 (BOOT) or GPIO 19 triggers `handleVoiceCapture()`
-- Browser hold-to-record unchanged and works independently
+- GPIO 19 is a **remote record trigger** — hold to start computer mic, release to stop
+- ESP32 POSTs start/stop to `/api/esp32/remote_record`
+- Browser polls `/api/remote_record/status` every 250ms
+- When ESP32 button held: browser starts recording from computer mic
+- When released: browser stops and sends audio through normal STT pipeline
+- Browser hold-to-record button unchanged and works independently
