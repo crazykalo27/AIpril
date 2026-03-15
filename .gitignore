@@ -10,9 +10,13 @@
 *.swo
 
 # Secrets (NEVER commit)
-include/secrets.h
+esp32-client/include/secrets.h
 credentials.json
 token.json
+server/credentials.json
+server/token.json
+server/.env
+server/settings.json
 
 # Build artifacts
 build/

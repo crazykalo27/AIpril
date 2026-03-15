@@ -3,89 +3,88 @@
 ESP32 firmware that records what you're doing via microphone,
 transcribes and interprets it with OpenAI, and creates a Google Calendar event.
 
-## MVP Flow
+## Architecture (Server + ESP32 over Cable)
 
 ```
 [User speaks] → [I2S mic] → [WAV buffer]
-    → [POST multipart to OpenAI /v1/audio/transcriptions] → transcript
-    → [POST JSON to OpenAI /v1/chat/completions] → event name
-    → [POST to Google Calendar API] → event created
+    → [USB Serial: AUDIO len + bytes] → [Server: OpenAI STT]
+    → [USB Serial: JSON interpret]     → [Server: LLM interpret]
+    → [USB Serial: JSON create_event] → [Server: Google Calendar API]
 ```
 
-**Two-call approach** (memory-efficient for ESP32):
-1. Multipart POST raw WAV bytes → transcript (no base64 overhead)
-2. JSON POST transcript text → structured event name
+**ESP32** (`esp32-client/`): Records audio, sends over USB cable. No WiFi.
+**Server** (`server/`): Runs on your computer, handles OpenAI (STT + LLM) and Google Calendar.
 
-## Architecture
+API keys live on the server only.
+
+## Project Structure
 
 ```
-src/
-├── main.cpp                              # setup() + loop()
-├── app/
-│   ├── app_controller.h/cpp              # Top-level orchestrator
-├── config/
-│   ├── config.h                          # Central compile-time config
-│   └── wifi_manager.h/cpp                # WiFi connection
-├── domain/
-│   ├── models.h                          # CalendarEvent, VoiceRecord, etc.
-│   └── enums.h                           # PromptState, InputSource
-├── services/
-│   ├── audio/
-│   │   ├── i2s_recorder.h/cpp            # INMP441 I2S mic → WAV
-│   │   └── buzzer.h/cpp                  # Beep/tone feedback
-│   ├── calendar/
-│   │   ├── reclaim_detector.h/cpp        # [reclaim] tag detection
-│   │   └── schedule_builder.h/cpp        # Events → schedule blocks
-│   ├── input/
-│   │   └── button_handler.h/cpp          # Debounced button input
-│   └── prompt/
-│       └── prompt_scheduler.h/cpp        # Interval-based prompting
-├── infrastructure/
-│   ├── network/
-│   │   └── https_client.h/cpp            # TLS HTTP client
-│   ├── google/
-│   │   ├── google_auth.h/cpp             # OAuth2 token refresh
-│   │   └── google_calendar.h/cpp         # Calendar API
-│   ├── openai/
-│   │   ├── openai_transcriber.h/cpp      # Whisper transcription
-│   │   └── openai_interpreter.h/cpp      # GPT event extraction
-│   └── storage/
-│       └── nvs_store.h/cpp               # NVS key-value persistence
-└── utils/
-    ├── time_utils.h/cpp                  # RFC3339 formatting, NTP
-    └── json_helpers.h                    # ArduinoJson wrappers
-
-include/
-├── pins.h                                # Hardware pin assignments
-└── secrets.h.example                     # API key template
-
-tools/
-└── google_auth_setup.py                  # One-time OAuth setup (run on PC)
-
-test/
-└── test_main.cpp                         # PlatformIO unit tests
+AIpril/
+├── esp32-client/           # PlatformIO ESP32 firmware
+│   ├── src/
+│   │   ├── main.cpp
+│   │   ├── app/            # AppController
+│   │   ├── config/         # WiFi, config
+│   │   ├── domain/         # models, enums
+│   │   ├── services/       # audio, buttons, calendar, prompt
+│   │   ├── infrastructure/
+│   │   │   ├── wire/       # WireClient (serial ↔ server)
+│   │   │   └── storage/    # NVS
+│   │   └── utils/
+│   ├── include/            # pins.h, secrets.h
+│   └── platformio.ini
+└── server/                 # Python serial bridge + web UI
+    ├── app.py              # Web UI (localhost:5000) + serial
+    ├── handlers.py         # transcribe, interpret, create_event
+    ├── settings.py         # Favorites, event labels (stored in settings.json)
+    ├── google_auth.py      # OAuth + Calendar API (see AUTH.md)
+    ├── config.py           # Env config
+    └── tools/
+        └── google_auth_setup.py   # One-time OAuth → token.json
 ```
 
 ## Setup
 
-### 1. Google OAuth (run once on PC)
+### 1. Server (run on your computer)
 
 ```bash
-pip install google-auth-oauthlib
-# Download credentials.json from Google Cloud Console
-python tools/google_auth_setup.py
-# Copy the refresh token
+cd server
+pip install -r requirements.txt
+copy .env.example .env
+# Edit .env: OPENAI_API_KEY, SERIAL_PORT (e.g. COM3)
+python tools/google_auth_setup.py   # One-time: creates token.json for Google Calendar
 ```
 
-### 2. Configure secrets
+### 2. ESP32
 
 ```bash
-cp include/secrets.h.example include/secrets.h
-# Edit: WiFi SSID/password, OpenAI key, Google client ID/secret
-# Optionally paste the refresh token as GOOGLE_REFRESH_TOKEN
+cd esp32-client
+pio run -t upload
 ```
 
-### 3. Wiring (INMP441 mic)
+No WiFi or secrets needed — ESP32 communicates only over USB cable.
+
+### 3. Run
+
+1. Start server: `cd server && python app.py COM3` (use your port)
+2. Open **http://localhost:5000** for settings
+3. Open **http://localhost:5000/debug** to test STT without ESP32 — record from your computer mic
+4. With ESP32: connect via USB, press voice button or send `record` over serial
+
+**No hardware?** Run `python app.py --no-serial` and use `/debug` to record & test STT.
+
+**Google Calendar**: Use OAuth, not an API key. See `server/AUTH.md`.
+
+## Serial Commands (ESP32)
+
+| Command | Description |
+|---------|-------------|
+| `record` | Manually trigger voice capture |
+| `status` | Show WiFi and time |
+| `help` | List commands |
+
+## Wiring (INMP441 mic)
 
 | INMP441 | ESP32 |
 |---------|-------|
@@ -95,36 +94,10 @@ cp include/secrets.h.example include/secrets.h
 | GND     | GND |
 | VDD     | 3.3V |
 
-Buzzer → GPIO 27. Buttons → GPIO 0, 32, 35 (with internal pullups).
-
-### 4. Build & Upload
-
-```bash
-# PlatformIO CLI
-pio run -t upload
-pio device monitor
-```
-
-Or open in PlatformIO IDE (VS Code extension).
-
-### 5. Send refresh token via serial (if not in secrets.h)
-
-```
-set_token 1//your-refresh-token-here
-```
-
-## Serial Commands
-
-| Command | Description |
-|---------|-------------|
-| `record` | Manually trigger voice capture |
-| `status` | Show WiFi, auth, and time status |
-| `set_token <token>` | Store Google refresh token in NVS |
-| `help` | List commands |
+Buzzer → GPIO 27. Buttons → GPIO 0, 32, 35.
 
 ## Future Work
 
-- HTTPS certificate validation (currently uses `setInsecure()`)
 - Configurable favorites via serial/NVS
 - Reclaim-aware prompt suppression from live calendar
 - Sleep/focus mode scheduling rules
