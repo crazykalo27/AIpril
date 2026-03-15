@@ -215,62 +215,323 @@ def serial_loop(port: str) -> None:
 
 PAGE_HTML = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AIpril</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
-    * { box-sizing: border-box; }
-    body { font-family: system-ui; max-width: 700px; margin: 2rem auto; padding: 0 1rem; }
-    h1 { font-size: 1.5rem; }
-    h2 { font-size: 1.1rem; margin-top: 1.5rem; }
-    label { display: block; margin-top: 1rem; font-weight: 500; }
-    input, textarea { width: 100%; padding: 0.5rem; margin-top: 0.25rem; }
-    textarea { min-height: 80px; }
-    button { margin-top: 0.5rem; padding: 0.5rem 1rem; cursor: pointer; min-height: 44px;
-             touch-action: manipulation; }
-    .label-list { max-height: 180px; overflow-y: auto; margin-top: 0.25rem; border: 1px solid #ddd;
-                   border-radius: 4px; padding: 0.25rem; }
-    .label-row { display: flex; align-items: center; gap: 0.25rem; margin: 0.25rem 0; }
-    .label-row input { flex: 1; margin: 0; }
-    .label-row .btn-del { min-height: 0; min-width: 0; margin: 0; padding: 0.25rem 0.5rem;
-                          background: #e53935; color: white; border: none; border-radius: 3px;
-                          font-size: 0.8rem; cursor: pointer; }
-    .msg { margin-top: 0.5rem; padding: 0.5rem; background: #e8f5e9; border-radius: 4px; }
-    .err { background: #ffebee; }
-    .section { margin-bottom: 1.5rem; padding-bottom: 1.5rem; border-bottom: 1px solid #eee; }
-    .section:last-of-type { border-bottom: none; }
-    .btn-row { display: flex; gap: 0.5rem; margin: 1rem 0; flex-wrap: wrap; }
-    .btn-record { background: #c62828; color: white; border: none; border-radius: 4px;
-                  user-select: none; -webkit-user-select: none; }
-    .btn-record.recording { background: #ff5252; animation: pulse 0.8s infinite alternate; }
-    @keyframes pulse { from { opacity: 1; } to { opacity: 0.6; } }
-    .btn-repeat { background: #1565c0; color: white; border: none; border-radius: 4px; }
-    .btn-favorite { background: #2e7d32; color: white; border: none; border-radius: 4px; }
-    .btn-default { background: #424242; color: white; border: none; border-radius: 4px; }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
-    #status { font-size: 0.9rem; color: #666; margin: 0.25rem 0; }
-    #result { margin-top: 0.5rem; padding: 1rem; background: #f5f5f5; border-radius: 4px;
-              min-height: 40px; white-space: pre-wrap; }
-    #result.empty { color: #999; }
-    #log { margin-top: 0.5rem; padding: 1rem; background: #1e1e1e; color: #d4d4d4;
-           font-family: monospace; font-size: 11px; max-height: 200px; overflow-y: auto;
-           border-radius: 4px; white-space: pre-wrap; }
-    #audioPlayer { margin-top: 0.5rem; width: 100%; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-    .auth-banner { padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1.5rem;
-                   display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
-    .auth-ok { background: #e8f5e9; color: #2e7d32; border: 1px solid #c8e6c9; }
-    .auth-fail { background: #ffebee; color: #c62828; border: 1px solid #ffcdd2; }
-    .auth-checking { background: #f5f5f5; color: #666; border: 1px solid #e0e0e0; }
-    .auth-banner button { margin: 0; min-height: 36px; background: #1565c0; color: white;
-                          border: none; border-radius: 4px; padding: 0.4rem 1rem; }
-    #appContent.locked { opacity: 0.35; pointer-events: none; user-select: none; }
+    :root {
+      --bg: #f8f9fc;
+      --surface: #ffffff;
+      --border: #e8eaef;
+      --text: #1a1d26;
+      --text2: #5f6577;
+      --accent: #6c5ce7;
+      --accent-light: #a29bfe;
+      --accent-bg: #f0eeff;
+      --red: #ff6b6b;
+      --red-dark: #ee5a5a;
+      --blue: #4facfe;
+      --green: #00b894;
+      --green-bg: #e6faf5;
+      --yellow: #fdcb6e;
+      --danger-bg: #fff0f0;
+      --danger: #d63031;
+      --radius: 12px;
+      --radius-sm: 8px;
+      --shadow: 0 1px 3px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.03);
+      --shadow-lg: 0 4px 20px rgba(108,92,231,0.10);
+    }
+
+    body {
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    .container { max-width: 680px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+
+    /* ---- Header ---- */
+    .header {
+      text-align: center;
+      padding: 2.5rem 0 1.5rem;
+    }
+    .header h1 {
+      font-size: 2rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, var(--accent), var(--blue));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      letter-spacing: -0.5px;
+    }
+    .header p {
+      color: var(--text2);
+      font-size: 0.9rem;
+      margin-top: 0.25rem;
+    }
+
+    /* ---- Cards ---- */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.5rem;
+      margin-bottom: 1rem;
+      box-shadow: var(--shadow);
+    }
+    .card h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .card h2 .icon {
+      width: 20px; height: 20px;
+      border-radius: 6px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.7rem;
+    }
+
+    /* ---- Auth Banner ---- */
+    .auth-banner {
+      border-radius: var(--radius);
+      padding: 0.85rem 1.25rem;
+      margin-bottom: 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      font-size: 0.875rem;
+      font-weight: 500;
+      box-shadow: var(--shadow);
+    }
+    .auth-ok { background: var(--green-bg); color: #0a7c65; border: 1px solid #b2ebe0; }
+    .auth-fail { background: var(--danger-bg); color: var(--danger); border: 1px solid #ffd4d4; }
+    .auth-checking { background: var(--surface); color: var(--text2); border: 1px solid var(--border); }
+    .auth-banner button {
+      margin: 0; margin-left: auto;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: var(--radius-sm);
+      padding: 0.5rem 1.1rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .auth-banner button:hover { background: #5a4bd6; }
+    #appContent.locked { opacity: 0.3; pointer-events: none; user-select: none;
+                         filter: grayscale(0.5); transition: opacity 0.3s, filter 0.3s; }
+    #appContent { transition: opacity 0.3s, filter 0.3s; }
+
+    /* ---- Connection status ---- */
+    #status {
+      font-size: 0.8rem;
+      color: var(--text2);
+      background: var(--bg);
+      display: inline-block;
+      padding: 0.3rem 0.75rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      margin-bottom: 1rem;
+    }
+
+    /* ---- Action Buttons ---- */
+    .actions { display: flex; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 1.25rem; }
+    .actions button {
+      flex: 1;
+      min-width: 110px;
+      min-height: 48px;
+      border: none;
+      border-radius: var(--radius-sm);
+      font-family: inherit;
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.1s, box-shadow 0.15s, opacity 0.15s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.4rem;
+    }
+    .actions button:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+    .actions button:active { transform: translateY(0); }
+    button:disabled { opacity: 0.4; cursor: not-allowed; transform: none !important; }
+
+    .btn-record {
+      background: linear-gradient(135deg, #ff6b6b, #ee5a5a);
+      color: white;
+      user-select: none; -webkit-user-select: none;
+    }
+    .btn-record.recording {
+      background: linear-gradient(135deg, #ff8787, #ff6b6b);
+      animation: glow 1s ease-in-out infinite alternate;
+    }
+    @keyframes glow {
+      from { box-shadow: 0 0 8px rgba(255,107,107,0.4); }
+      to   { box-shadow: 0 0 20px rgba(255,107,107,0.7); }
+    }
+    .btn-repeat { background: linear-gradient(135deg, var(--blue), #0984e3); color: white; }
+    .btn-favorite { background: linear-gradient(135deg, var(--green), #00a884); color: white; }
+    .btn-default { background: var(--bg); color: var(--text); border: 1px solid var(--border) !important; }
+    .btn-default:hover { background: #eef0f4; }
+
+    /* ---- Result ---- */
+    #result {
+      padding: 1rem 1.15rem;
+      background: var(--accent-bg);
+      border: 1px solid #e0daf8;
+      border-radius: var(--radius-sm);
+      font-size: 0.9rem;
+      line-height: 1.5;
+      min-height: 44px;
+      white-space: pre-wrap;
+      color: var(--text);
+    }
+    #result.empty { color: var(--text2); background: var(--bg); border-color: var(--border); }
+
+    /* ---- Audio Player ---- */
+    #audioPlayer {
+      margin-top: 0.75rem;
+      width: 100%;
+      border-radius: var(--radius-sm);
+    }
+
+    /* ---- Log ---- */
+    .log-toggle {
+      margin-top: 0.75rem;
+      font-size: 0.75rem;
+      color: var(--text2);
+      cursor: pointer;
+      user-select: none;
+      display: flex;
+      align-items: center;
+      gap: 0.3rem;
+    }
+    .log-toggle:hover { color: var(--accent); }
+    #log {
+      margin-top: 0.5rem;
+      padding: 0.85rem 1rem;
+      background: #1e1f2e;
+      color: #c9cde0;
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+      font-size: 0.7rem;
+      max-height: 160px;
+      overflow-y: auto;
+      border-radius: var(--radius-sm);
+      white-space: pre-wrap;
+      line-height: 1.7;
+      display: none;
+    }
+    #log.open { display: block; }
+
+    /* ---- Settings ---- */
+    label {
+      display: block;
+      font-size: 0.8rem;
+      font-weight: 500;
+      color: var(--text2);
+      margin-top: 1rem;
+      margin-bottom: 0.25rem;
+    }
+    input, textarea {
+      width: 100%;
+      padding: 0.6rem 0.75rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      font-family: inherit;
+      font-size: 0.875rem;
+      color: var(--text);
+      background: var(--bg);
+      transition: border-color 0.15s, box-shadow 0.15s;
+      outline: none;
+    }
+    input:focus, textarea:focus {
+      border-color: var(--accent-light);
+      box-shadow: 0 0 0 3px rgba(108,92,231,0.1);
+    }
+    textarea { min-height: 70px; resize: vertical; }
+
+    .label-list {
+      max-height: 180px;
+      overflow-y: auto;
+      margin-top: 0.25rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 0.35rem;
+      background: var(--bg);
+    }
+    .label-row {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      margin: 0.25rem 0;
+    }
+    .label-row input { flex: 1; margin: 0; padding: 0.45rem 0.6rem; font-size: 0.8rem; }
+    .label-row .btn-del {
+      min-height: 0; min-width: 0; margin: 0;
+      padding: 0.3rem 0.55rem;
+      background: transparent;
+      color: var(--text2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 0.7rem;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .label-row .btn-del:hover { background: var(--danger-bg); color: var(--danger); border-color: #ffd4d4; }
+
+    .settings-actions {
+      display: flex;
+      gap: 0.5rem;
+      margin-top: 1rem;
+      flex-wrap: wrap;
+    }
+    .settings-actions button {
+      padding: 0.55rem 1.1rem;
+      border-radius: var(--radius-sm);
+      font-family: inherit;
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      transition: background 0.15s, transform 0.1s;
+    }
+    .settings-actions button:hover { transform: translateY(-1px); }
+    .btn-add { background: var(--bg); color: var(--text); border: 1px solid var(--border) !important; }
+    .btn-add:hover { background: #eef0f4; }
+    .btn-save { background: var(--accent); color: white; }
+    .btn-save:hover { background: #5a4bd6; }
+
+    .msg { margin-top: 0.75rem; padding: 0.6rem 0.85rem; border-radius: var(--radius-sm);
+           font-size: 0.8rem; font-weight: 500; }
+    .msg.ok { background: var(--green-bg); color: #0a7c65; }
+    .msg.err { background: var(--danger-bg); color: var(--danger); }
+
+    .dur-input { width: 100px !important; }
   </style>
 </head>
 <body>
-  <h1>AIpril</h1>
+<div class="container">
+
+  <div class="header">
+    <h1>AIpril</h1>
+    <p>Voice-powered calendar assistant</p>
+  </div>
 
   <div id="authBanner" class="auth-banner auth-checking">
     <span id="authText">Checking Google Calendar authentication...</span>
@@ -278,53 +539,65 @@ PAGE_HTML = """
 
   <div id="appContent" class="locked">
 
-    <div class="section">
-      <h2>Audio Echo Test</h2>
-      <p id="status">{{ conn_status }}</p>
+    <!-- Record & Actions -->
+    <div class="card">
+      <h2><span class="icon" style="background:linear-gradient(135deg,#ff6b6b,#ee5a5a);color:#fff;">&#9679;</span> Record</h2>
+      <span id="status">{{ conn_status }}</span>
 
-      <div class="btn-row">
-        <button type="button" id="pingBtn" class="btn-default">Ping ESP32</button>
+      <div class="actions">
         <button type="button" id="recordBtn" class="btn-record">Hold to Record</button>
-        <button type="button" id="repeatBtn" class="btn-repeat">Repeat</button>
+        <button type="button" id="repeatBtn" class="btn-repeat">Repeat Last</button>
         <button type="button" id="favoriteBtn" class="btn-favorite">Favorite</button>
+        <button type="button" id="pingBtn" class="btn-default">Ping</button>
       </div>
 
       <div id="result" class="empty">
-        Record → ESP32 echo → transcribe → extract activity.
+        Hold the record button, say what you're doing, and release.
       </div>
 
       <audio id="audioPlayer" controls style="display:none;"></audio>
 
-      <h3>Log</h3>
+      <div class="log-toggle" onclick="$('log').classList.toggle('open'); this.querySelector('span').textContent = $('log').classList.contains('open') ? '&#9660;' : '&#9654;';">
+        <span>&#9654;</span> Debug log
+      </div>
       <div id="log">&mdash;</div>
     </div>
 
-    <div class="section">
-      <h2>Settings</h2>
+    <!-- Settings -->
+    <div class="card">
+      <h2><span class="icon" style="background:var(--accent-bg);color:var(--accent);">&#9881;</span> Settings</h2>
       <form id="form" method="POST" action="/api/settings">
+
         <label>Favorite event name</label>
         <input name="favorite_name" value="{{ favorite_name }}" placeholder="Focus Work">
+
         <label>Favorite event description</label>
         <textarea name="favorite_desc" placeholder="Deep focus block">{{ favorite_desc }}</textarea>
+
         <label>Event duration (minutes)</label>
         <input name="event_duration" type="number" min="5" max="480" step="5"
-               value="{{ event_duration }}" style="width:120px;">
-        <label>Event labels (LLM matches transcript to these)</label>
+               value="{{ event_duration }}" class="dur-input">
+
+        <label>Event labels</label>
         <div class="label-list" id="labels">
           {% for l in event_labels %}
           <div class="label-row">
             <input type="text" name="label" value="{{ l }}">
-            <button type="button" class="btn-del" onclick="this.parentElement.remove()">✕</button>
+            <button type="button" class="btn-del" onclick="this.parentElement.remove()">&#10005;</button>
           </div>
           {% endfor %}
         </div>
-        <button type="button" id="addLabelBtn">+ Add label</button>
-        <button type="submit">Save</button>
+
+        <div class="settings-actions">
+          <button type="button" id="addLabelBtn" class="btn-add">+ Add label</button>
+          <button type="submit" class="btn-save">Save settings</button>
+        </div>
       </form>
       <div id="msg"></div>
     </div>
 
   </div>
+</div>
 
   <script>
     let mediaRecorder = null;
@@ -533,8 +806,8 @@ PAGE_HTML = """
           body: JSON.stringify(body)
         });
         const data = await r.json();
-        $('msg').textContent = data.ok ? 'Saved.' : (data.error || 'Error');
-        $('msg').className = data.ok ? 'msg' : 'msg err';
+        $('msg').textContent = data.ok ? 'Settings saved.' : (data.error || 'Error');
+        $('msg').className = data.ok ? 'msg ok' : 'msg err';
       });
     }
 
