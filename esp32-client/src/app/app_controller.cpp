@@ -71,6 +71,7 @@ void AppController::begin() {
 }
 
 void AppController::update() {
+    _http.update();
     _webServer.handleClient();
     _buttons.update();
 

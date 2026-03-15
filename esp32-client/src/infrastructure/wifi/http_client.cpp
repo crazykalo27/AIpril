@@ -12,17 +12,33 @@ void HttpClient::begin(const char* serverUrl) {
         _serverUrl.remove(_serverUrl.length() - 1);
     }
     Serial.printf("[HTTP] Server: %s\n", _serverUrl.c_str());
+    tryRegister();
+}
 
-    // Register with server so it knows our IP
+bool HttpClient::tryRegister() {
     HTTPClient http;
     String url = _serverUrl + "/api/esp32/register";
-    if (http.begin(url)) {
-        http.addHeader("Content-Type", "application/json");
-        http.setTimeout(5000);
-        int code = http.POST("{}");
-        Serial.printf("[HTTP] Register: %d\n", code);
-        http.end();
+    if (!http.begin(url)) {
+        Serial.println("[HTTP] Register: begin failed");
+        _registered = false;
+        return false;
     }
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(5000);
+    int code = http.POST("{}");
+    http.end();
+    _registered = (code == 200);
+    _lastRegisterAttempt = millis();
+    Serial.printf("[HTTP] Register: %d (%s)\n", code, _registered ? "ok" : "failed");
+    return _registered;
+}
+
+void HttpClient::update() {
+    if (_registered) return;
+    if (WiFi.status() != WL_CONNECTED) return;
+    unsigned long now = millis();
+    if (now - _lastRegisterAttempt < REGISTER_INTERVAL_MS) return;
+    tryRegister();
 }
 
 HttpResponse HttpClient::postAudio(const uint8_t* data, size_t len) {
@@ -34,6 +50,7 @@ HttpResponse HttpClient::postAudio(const uint8_t* data, size_t len) {
 
     if (!http.begin(url)) {
         r.error = "HTTP begin failed";
+        _registered = false;
         return r;
     }
 
@@ -44,6 +61,7 @@ HttpResponse HttpClient::postAudio(const uint8_t* data, size_t len) {
     if (code <= 0) {
         r.error = "HTTP error: " + String(http.errorToString(code));
         Serial.printf("[HTTP] Error: %s\n", r.error.c_str());
+        _registered = false;
         http.end();
         return r;
     }
@@ -69,6 +87,7 @@ HttpResponse HttpClient::postRepeat() {
 
     if (!http.begin(url)) {
         r.error = "HTTP begin failed";
+        _registered = false;
         return r;
     }
 
@@ -78,6 +97,7 @@ HttpResponse HttpClient::postRepeat() {
 
     if (code <= 0) {
         r.error = "HTTP error: " + String(http.errorToString(code));
+        _registered = false;
         http.end();
         return r;
     }
@@ -98,6 +118,7 @@ HttpResponse HttpClient::postFavorite() {
 
     if (!http.begin(url)) {
         r.error = "HTTP begin failed";
+        _registered = false;
         return r;
     }
 
@@ -107,6 +128,7 @@ HttpResponse HttpClient::postFavorite() {
 
     if (code <= 0) {
         r.error = "HTTP error: " + String(http.errorToString(code));
+        _registered = false;
         http.end();
         return r;
     }

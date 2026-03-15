@@ -140,3 +140,12 @@ Conceptual notes on changes and project status.
 - Repeat button: pin 33 → 25 (I2S LRCK moved to 15 to free 25)
 - Pin 33: PWM speaker for ping beep (ledc channel 1)
 - Beep on both HTTP /ping and serial PING
+
+## 2026-03-15 — ESP32 Auto-Reconnect to Server
+
+**Goal**: ESP32 re-registers with server when server restarts.
+
+**Changes**:
+- `HttpClient::update()` called every loop — retries register every 10s if not connected
+- Any HTTP failure sets `_registered = false`, triggering re-register
+- WiFi reconnect already existed in `main.cpp`; now server reconnect also handled

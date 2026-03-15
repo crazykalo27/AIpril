@@ -22,6 +22,9 @@ class HttpClient {
 public:
     void begin(const char* serverUrl);
 
+    /// Call every loop — re-registers with server if needed.
+    void update();
+
     /// POST raw WAV audio to /api/esp32/record. Server does STT + interpret + calendar.
     HttpResponse postAudio(const uint8_t* data, size_t len);
 
@@ -31,8 +34,15 @@ public:
     /// POST to /api/trigger/favorite (server logs favorite).
     HttpResponse postFavorite();
 
+    bool isRegistered() const { return _registered; }
+
 private:
     String _serverUrl;
+    bool _registered = false;
+    unsigned long _lastRegisterAttempt = 0;
+    static const unsigned long REGISTER_INTERVAL_MS = 10000;
+
+    bool tryRegister();
     HttpResponse parseJson(const String& body);
 };
 
