@@ -1,7 +1,7 @@
 """API handlers called by the serial bridge."""
 import base64
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 
 from openai import OpenAI
@@ -112,7 +112,7 @@ def handle_list_events(days_ahead: int = 7) -> dict:
     """List upcoming calendar events. Returns events in next N days."""
     creds = get_credentials(CREDENTIALS_FILE, TOKEN_FILE)
     if not creds:
-        return {"ok": False, "error": "Google not authenticated. Run tools/google_auth_setup.py"}
+        return {"ok": False, "error": "Google not authenticated"}
 
     now = datetime.utcnow()
     time_min = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -120,3 +120,77 @@ def handle_list_events(days_ahead: int = 7) -> dict:
 
     events = list_calendar_events(creds, time_min, time_max)
     return {"ok": True, "events": events}
+
+
+def _parse_gcal_time(s: str) -> datetime | None:
+    """Parse a Google Calendar time string into a UTC-aware datetime."""
+    if not s:
+        return None
+    if len(s) == 10:
+        try:
+            d = date.fromisoformat(s)
+            return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def handle_current_events() -> dict:
+    """Fetch today's events, filter to those overlapping right now. Detects duplicates."""
+    creds = get_credentials(CREDENTIALS_FILE, TOKEN_FILE)
+    if not creds:
+        return {"ok": False, "error": "Google not authenticated"}
+
+    now = datetime.now(timezone.utc)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+
+    all_events = list_calendar_events(
+        creds,
+        day_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        day_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+
+    active = []
+    for ev in all_events:
+        ev_start = _parse_gcal_time(ev.get("start", ""))
+        ev_end = _parse_gcal_time(ev.get("end", ""))
+        if not ev_start or not ev_end:
+            continue
+        if ev_start <= now < ev_end:
+            active.append(ev)
+
+    seen: dict[str, list] = {}
+    for ev in active:
+        key = (ev.get("summary", "")).strip().lower()
+        seen.setdefault(key, []).append(ev)
+
+    duplicates = []
+    for key, group in seen.items():
+        if len(group) > 1:
+            duplicates.append({"name": group[0].get("summary", ""), "count": len(group),
+                               "ids": [e["id"] for e in group]})
+
+    return {"ok": True, "events": active, "duplicates": duplicates,
+            "checked_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "total": len(active)}
+
+
+def handle_today_events() -> dict:
+    """Fetch all events for the current day (UTC)."""
+    creds = get_credentials(CREDENTIALS_FILE, TOKEN_FILE)
+    if not creds:
+        return {"ok": False, "error": "Google not authenticated"}
+
+    now = datetime.now(timezone.utc)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+
+    events = list_calendar_events(
+        creds,
+        day_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        day_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    return {"ok": True, "events": events, "date": day_start.strftime("%Y-%m-%d")}

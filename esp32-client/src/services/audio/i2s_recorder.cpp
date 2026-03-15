@@ -3,6 +3,7 @@
  */
 
 #include "i2s_recorder.h"
+#include "config/config.h"
 #include <driver/i2s.h>
 
 #define WAV_HEADER_SIZE 44
@@ -10,8 +11,7 @@
 bool I2SRecorder::begin(int sampleRate, int bclk, int lrck, int din) {
     _sampleRate = sampleRate;
 
-    // Max buffer: allow up to 10 seconds
-    _bufSize = WAV_HEADER_SIZE + (sampleRate * 10 * 2);
+    _bufSize = WAV_HEADER_SIZE + (sampleRate * AUDIO_RECORD_SECONDS * 2);
 
     // Prefer PSRAM if available
     #if defined(BOARD_HAS_PSRAM) || defined(CONFIG_SPIRAM)

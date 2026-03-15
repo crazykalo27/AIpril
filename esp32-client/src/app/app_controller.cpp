@@ -1,44 +1,79 @@
 /**
  * Application controller implementation.
  *
- * Uses WireClient to communicate with host server over serial.
- * Server handles OpenAI (transcribe, interpret) and Google Calendar.
+ * Uses HttpClient (WiFi) for server communication.
+ * Runs a WebServer on port 80 so the server can ping the ESP32.
+ * Serial is for debug output and manual commands only.
  */
 
 #include "app_controller.h"
-#include <string.h>
+#include "secrets.h"
 
 AppController::AppController()
     : _buzzer(PIN_BUZZER)
     , _buttons(PIN_BTN_VOICE, PIN_BTN_REPEAT, PIN_BTN_FAVORITE)
     , _scheduler(PROMPT_INTERVAL_MS)
     , _reclaimDetector(RECLAIM_TAG)
+    , _webServer(80)
 {}
 
-void AppController::begin() {
-    Serial.println("\n=== AIpril v0 ===");
+#define PING_BEEP_CHANNEL  1
+#define PING_BEEP_HZ       2000
+#define PING_BEEP_MS       100
 
-    // NVS
+void AppController::pingBeep() {
+    ledcWriteTone(PING_BEEP_CHANNEL, PING_BEEP_HZ);
+    delay(PING_BEEP_MS);
+    ledcWriteTone(PING_BEEP_CHANNEL, 0);
+}
+
+void AppController::setupWebServer() {
+    _webServer.on("/ping", HTTP_GET, [this]() {
+        Serial.println("[HTTP] /ping → PONG");
+        pingBeep();
+        _webServer.send(200, "application/json", "{\"ok\":true,\"message\":\"PONG\"}");
+    });
+
+    _webServer.on("/status", HTTP_GET, [this]() {
+        String json = "{\"ok\":true,\"wifi\":true,\"ip\":\"" + WiFi.localIP().toString() + "\"}";
+        _webServer.send(200, "application/json", json);
+    });
+
+    _webServer.begin();
+    Serial.printf("[HTTP] ESP32 web server on port 80 (IP: %s)\n", WiFi.localIP().toString().c_str());
+}
+
+void AppController::begin() {
+    Serial.println("\n=== AIpril v0 (WiFi) ===");
+
     _store.begin(NVS_NAMESPACE);
 
-    // Hardware (no WiFi — communicates with server over cable)
+    _http.begin(SERVER_URL);
     _recorder.begin(AUDIO_SAMPLE_RATE, PIN_I2S_BCLK, PIN_I2S_LRCK, PIN_I2S_DIN);
     _buzzer.begin();
     _buttons.begin();
 
-    // Status LED
     pinMode(PIN_LED, OUTPUT);
     digitalWrite(PIN_LED, HIGH);
+    pinMode(PIN_LED_REPEAT, OUTPUT);
+    digitalWrite(PIN_LED_REPEAT, LOW);
+
+    ledcSetup(PING_BEEP_CHANNEL, PING_BEEP_HZ, 8);
+    ledcAttachPin(PIN_PING_SPEAKER, PING_BEEP_CHANNEL);
+    ledcWrite(PING_BEEP_CHANNEL, 0);
+
+    if (WiFi.status() == WL_CONNECTED) {
+        setupWebServer();
+    }
 
     Serial.println("[App] Ready");
-    Serial.println("READY");  // Server uses this to confirm ESP32 is up
     _buzzer.success();
 }
 
 void AppController::update() {
+    _webServer.handleClient();
     _buttons.update();
 
-    // Button triggers
     if (_buttons.wasVoicePressed()) {
         handleVoiceCapture();
     }
@@ -49,17 +84,13 @@ void AppController::update() {
         handleFavorite();
     }
 
-    // Interval-based prompt
     if (_scheduler.shouldPrompt()) {
         _buzzer.prompt();
         _scheduler.reset();
-        // Wait for button press (voice capture handled next loop)
     }
 
-    // Serial commands
     handleSerial();
-
-    delay(50);
+    delay(10);
 }
 
 void AppController::handleSerial() {
@@ -68,54 +99,31 @@ void AppController::handleSerial() {
     String line = Serial.readStringUntil('\n');
     line.trim();
 
-    // Triggers from server (web UI buttons)
     if (line == "PING") {
+        pingBeep();
         Serial.println("PONG");
-        return;
-    }
-    if (line == "trigger_record") {
+    } else if (line == "record") {
         handleVoiceCapture();
-        return;
-    }
-    if (line == "trigger_repeat") {
+    } else if (line == "repeat") {
         handleRepeat();
-        return;
-    }
-    if (line == "trigger_favorite") {
+    } else if (line == "favorite") {
         handleFavorite();
-        return;
-    }
-    if (line == "RETRIEVE_LAST") {
-        handleRetrieveLast();
-        return;
-    }
-
-    // Audio from server (hold-to-record on laptop) — echo back as if ESP32 recorded it
-    if (line.startsWith("AUDIO_PLAYBACK ")) {
-        handleAudioPlayback(line);
-        return;
-    }
-
-    // Manual serial commands
-    if (line == "status") {
-        Serial.println("Ready (cable mode)");
-    }
-    else if (line == "record") {
-        handleVoiceCapture();
-    }
-    else if (line == "help") {
-        Serial.println("Commands: status, record, help");
+    } else if (line == "status") {
+        Serial.printf("WiFi: %s, IP: %s\n",
+            WiFi.status() == WL_CONNECTED ? "connected" : "disconnected",
+            WiFi.localIP().toString().c_str());
+    } else if (line == "help") {
+        Serial.println("Commands: record, repeat, favorite, status, help");
     }
 }
 
 // ---------------------------------------------------------------------------
-// MVP: voice → wire (transcribe) → wire (interpret) → wire (create_event)
+// Voice: record → POST audio to server over WiFi
 // ---------------------------------------------------------------------------
 void AppController::handleVoiceCapture() {
     Serial.println("\n--- Voice Capture ---");
     _buzzer.prompt();
 
-    // 1. Record
     size_t len = _recorder.record(AUDIO_RECORD_SECONDS);
     if (len == 0) {
         Serial.println("[App] Recording failed");
@@ -123,142 +131,62 @@ void AppController::handleVoiceCapture() {
         return;
     }
 
-    // 2. Transcribe via server
-    WireResponse tr = _wire.transcribe(_recorder.getBuffer(), len);
+    Serial.printf("[App] Recorded %u bytes, sending to server...\n", (unsigned)len);
+    HttpResponse resp = _http.postAudio(_recorder.getBuffer(), len);
     _recorder.clear();
 
-    if (!tr.ok || tr.transcript.isEmpty()) {
-        Serial.printf("[App] Transcription failed: %s\n", tr.error.c_str());
+    if (!resp.ok) {
+        Serial.printf("[App] Error: %s\n", resp.error.c_str());
         _buzzer.error();
         return;
     }
 
-    // 3. Interpret via server
-    WireResponse interp = _wire.interpret(tr.transcript);
-    InterpretedActivity activity;
-    activity.transcript = tr.transcript;
-    activity.eventName = interp.ok ? interp.eventName : tr.transcript.substring(0, 40);
-    activity.category = interp.category;
-    activity.source = InputSource::VOICE;
+    Serial.printf("[App] '%s' → %s (event %s)\n",
+                  resp.transcript.c_str(),
+                  resp.eventName.c_str(),
+                  resp.eventId.c_str());
 
-    // 4. Create calendar event via server (server uses its time)
-    WireResponse cal = _wire.createEvent(activity.eventName, activity.transcript, 30);
-
-    if (!cal.ok || cal.eventId.isEmpty()) {
-        Serial.printf("[App] Calendar failed: %s\n", cal.error.c_str());
-        _buzzer.error();
-        return;
-    }
-
-    // 5. Cache for repeat
-    _lastActivity = activity;
+    _lastEventName = resp.eventName;
     _hasLastActivity = true;
-
-    Serial.printf("[App] Done: '%s' -> event %s\n",
-                  activity.eventName.c_str(), cal.eventId.c_str());
     _buzzer.success();
 }
 
 // ---------------------------------------------------------------------------
-// Repeat: re-log last activity
+// Repeat: POST to server, flash LED
 // ---------------------------------------------------------------------------
 void AppController::handleRepeat() {
-    if (!_hasLastActivity) {
-        Serial.println("[App] No previous activity to repeat");
-        _buzzer.error();
-        return;
-    }
+    Serial.println("[App] Repeat");
+    digitalWrite(PIN_LED_REPEAT, HIGH);
 
-    WireResponse cal = _wire.createEvent(
-        _lastActivity.eventName, _lastActivity.transcript, 30
-    );
+    HttpResponse resp = _http.postRepeat();
 
-    if (cal.ok && !cal.eventId.isEmpty()) {
-        Serial.printf("[App] Repeated: '%s'\n", _lastActivity.eventName.c_str());
+    if (resp.ok) {
+        Serial.printf("[App] Repeated: %s (event %s)\n",
+                      resp.eventName.c_str(), resp.eventId.c_str());
         _buzzer.success();
     } else {
+        Serial.printf("[App] Repeat error: %s\n", resp.error.c_str());
         _buzzer.error();
     }
+
+    delay(1000);
+    digitalWrite(PIN_LED_REPEAT, LOW);
 }
 
 // ---------------------------------------------------------------------------
-// Audio playback: server sends laptop-recorded audio, we echo back as if we recorded it
-// ---------------------------------------------------------------------------
-void AppController::handleAudioPlayback(const String& line) {
-    // Parse "AUDIO_PLAYBACK <len>"
-    int spaceIdx = line.indexOf(' ');
-    if (spaceIdx < 0) return;
-    size_t len = (size_t)line.substring(spaceIdx + 1).toInt();
-    if (len == 0 || len > 500000) return;  // Sanity limit ~500KB
-
-    // Acknowledge receipt immediately so server knows we got the command
-    Serial.printf("AUDIO_PLAYBACK_ACK %u\n", (unsigned)len);
-
-    // Read bytes from Serial (server wrote them)
-    uint8_t* buf = (uint8_t*)malloc(len);
-    if (!buf) return;
-    size_t got = 0;
-    unsigned long start = millis();
-    while (got < len && (millis() - start) < 30000) {
-        while (Serial.available() && got < len) {
-            buf[got++] = (uint8_t)Serial.read();
-        }
-        if (got < len) delay(5);
-    }
-    if (got != len) {
-        free(buf);
-        Serial.printf("[App] Audio playback: read %d/%d (timeout or incomplete)\n", (int)got, (int)len);
-        return;
-    }
-    Serial.printf("[App] Audio playback: read %d bytes, storing and echoing...\n", (int)len);
-
-    // Store for retrieve (replace previous)
-    if (_storedAudio) free(_storedAudio);
-    _storedAudio = (uint8_t*)malloc(len);
-    if (_storedAudio) {
-        memcpy(_storedAudio, buf, len);
-        _storedAudioLen = len;
-    }
-
-    // Echo back as "AUDIO len\n" + bytes (same format as real recording)
-    delay(300);
-    Serial.print("AUDIO ");
-    Serial.println(len);
-    const size_t CHUNK = 512;
-    for (size_t i = 0; i < len; i += CHUNK) {
-        size_t n = min(CHUNK, len - i);
-        Serial.write(buf + i, n);
-    }
-    free(buf);
-    Serial.println("AUDIO_ECHO_DONE");
-}
-
-void AppController::handleRetrieveLast() {
-    if (!_storedAudio || _storedAudioLen == 0) {
-        Serial.println("[App] No stored audio to retrieve");
-        return;
-    }
-    Serial.printf("[App] Retrieving %d bytes\n", (int)_storedAudioLen);
-    Serial.print("AUDIO ");
-    Serial.println(_storedAudioLen);
-    const size_t CHUNK = 512;
-    for (size_t i = 0; i < _storedAudioLen; i += CHUNK) {
-        size_t n = min(CHUNK, _storedAudioLen - i);
-        Serial.write(_storedAudio + i, n);
-    }
-    Serial.println("AUDIO_ECHO_DONE");
-}
-
-// ---------------------------------------------------------------------------
-// Favorite: uses server settings (configure in web UI at localhost:5000)
+// Favorite: POST to server
 // ---------------------------------------------------------------------------
 void AppController::handleFavorite() {
-    WireResponse cal = _wire.createFavorite(30);
+    Serial.println("[App] Favorite");
 
-    if (cal.ok && !cal.eventId.isEmpty()) {
-        Serial.println("[App] Favorite logged");
+    HttpResponse resp = _http.postFavorite();
+
+    if (resp.ok) {
+        Serial.printf("[App] Favorite: %s (event %s)\n",
+                      resp.eventName.c_str(), resp.eventId.c_str());
         _buzzer.success();
     } else {
+        Serial.printf("[App] Favorite error: %s\n", resp.error.c_str());
         _buzzer.error();
     }
 }

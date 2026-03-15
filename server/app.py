@@ -23,6 +23,8 @@ from handlers import (
     handle_create_event,
     handle_create_favorite,
     handle_list_events,
+    handle_current_events,
+    handle_today_events,
 )
 from google_auth import is_authenticated, get_auth_url, handle_auth_callback
 from settings import load, save, get_interpret_prompt, DEFAULTS
@@ -39,16 +41,37 @@ _ser_lock = threading.Lock()
 
 _last_activity: dict | None = None
 
-_expecting_echo = False
+# ESP32 WiFi tracking — updated when ESP32 hits /api/esp32/record or /api/esp32/register
+_esp32_wifi_ip: str | None = None
+_esp32_wifi_last_seen: float = 0
+
+# Browser audio storage (no serial echo needed)
 _echo_audio: bytes = b""
 _echo_mime: str = "audio/webm"
-_echo_event = threading.Event()
 
+# Serial ping (legacy, kept for debug)
 _expecting_pong = False
 _pong_event = threading.Event()
+_expecting_echo = False
+_echo_event = threading.Event()
+
+# Debug log buffer (last 100 entries) — source: browser|esp32_wifi|serial
+_debug_log: list[str] = []
+_DEBUG_LOG_MAX = 100
+
+
+def _debug(msg: str, source: str = "server") -> None:
+    """Append to server debug log and print to console."""
+    global _debug_log
+    entry = f"[{source}] {msg}"
+    print(entry)
+    _debug_log.append(entry)
+    if len(_debug_log) > _DEBUG_LOG_MAX:
+        _debug_log.pop(0)
+
 
 # ---------------------------------------------------------------------------
-# Serial helpers
+# Serial helpers (debug only)
 # ---------------------------------------------------------------------------
 
 
@@ -61,26 +84,37 @@ def send_line(text: str) -> bool:
     return True
 
 
-def send_audio_to_esp32(audio_bytes: bytes) -> bool:
-    """Send audio to ESP32 in throttled chunks to avoid RX buffer overflow."""
-    with _ser_lock:
-        if not _ser or not _ser.is_open:
-            return False
-        header = f"AUDIO_PLAYBACK {len(audio_bytes)}\n"
-        _ser.write(header.encode("utf-8"))
-        _ser.flush()
-        time.sleep(0.05)
-        CHUNK = 1024
-        for i in range(0, len(audio_bytes), CHUNK):
-            _ser.write(audio_bytes[i:i + CHUNK])
-            _ser.flush()
-        print(f"[Echo] Sent AUDIO_PLAYBACK ({len(audio_bytes)} bytes) to ESP32")
-    return True
+def _update_esp32_wifi(ip: str) -> None:
+    global _esp32_wifi_ip, _esp32_wifi_last_seen
+    _esp32_wifi_ip = ip
+    _esp32_wifi_last_seen = time.time()
 
 
 # ---------------------------------------------------------------------------
 # Serial protocol handlers
 # ---------------------------------------------------------------------------
+
+
+def handle_esp32_repeat() -> None:
+    """ESP32 pressed the repeat button — run server-side repeat logic (serial or WiFi)."""
+    if not _last_activity:
+        _debug("Repeat (serial): no previous activity", "serial")
+        return
+    _debug(f"Repeat (serial): re-creating \"{_last_activity['event_name']}\"", "serial")
+    s = load()
+    dur = s.get("event_duration", DEFAULTS["event_duration"])
+    try:
+        result = handle_create_event(
+            _last_activity["event_name"],
+            _last_activity["transcript"],
+            dur,
+        )
+        if result.get("ok"):
+            _debug(f"Repeat (serial): created event {result.get('event_id', '')}", "serial")
+        else:
+            _debug(f"Repeat (serial): error {result.get('error', '')}", "serial")
+    except Exception as e:
+        _debug(f"Repeat (serial): exception {e}", "serial")
 
 
 def send_response(ser: serial.Serial, obj: dict) -> None:
@@ -123,6 +157,7 @@ def process_audio_binary(ser: serial.Serial, line: str) -> None:
 
 def process_command(ser: serial.Serial, cmd: dict) -> None:
     c = cmd.get("cmd", "")
+    _debug(f"Serial: command {c} (USB)", "serial")
     resp: dict = {"cmd": c, "ok": False}
     try:
         if c == "transcribe":
@@ -184,14 +219,18 @@ def serial_loop(port: str) -> None:
             if not line:
                 continue
 
-            print(f"[Serial] RX: {line[:80]}{'...' if len(line) > 80 else ''}")
+            _debug(f"Serial RX: {line[:80]}{'...' if len(line) > 80 else ''}", "serial")
 
             if line == "PONG":
                 if _expecting_pong:
                     _expecting_pong = False
                     _pong_event.set()
+                _debug("Serial: PONG received (ESP32 responded over USB)", "serial")
             elif line == "READY":
-                print("[Info] ESP32 is ready")
+                _debug("Serial: ESP32 READY", "serial")
+            elif line == "REPEAT":
+                _debug("Serial: REPEAT command from ESP32 (button press over USB)", "serial")
+                handle_esp32_repeat()
             elif line.startswith("AUDIO_PLAYBACK_ACK"):
                 pass
             elif line == "AUDIO_ECHO_DONE":
@@ -466,6 +505,35 @@ PAGE_HTML = """
     }
     textarea { min-height: 70px; resize: vertical; }
 
+    .day-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      margin-top: 0.75rem;
+    }
+    .day-header span { font-size: 0.9rem; color: var(--text2); }
+    .day-events {
+      margin-top: 0.5rem;
+      padding: 0.75rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      max-height: 220px;
+      overflow-y: auto;
+      font-size: 0.85rem;
+    }
+    .day-event {
+      padding: 0.4rem 0;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 0.15rem;
+    }
+    .day-event:last-child { border-bottom: none; }
+    .day-event-summary { font-weight: 600; color: var(--text); }
+    .day-event-time { font-size: 0.75rem; color: var(--text2); }
+
     .label-list {
       max-height: 180px;
       overflow-y: auto;
@@ -557,10 +625,20 @@ PAGE_HTML = """
 
       <audio id="audioPlayer" controls style="display:none;"></audio>
 
-      <div class="log-toggle" onclick="$('log').classList.toggle('open'); this.querySelector('span').textContent = $('log').classList.contains('open') ? '&#9660;' : '&#9654;';">
+      <div class="log-toggle" id="logToggle" onclick="toggleDebugLog(this)">
         <span>&#9654;</span> Debug log
       </div>
       <div id="log">&mdash;</div>
+    </div>
+
+    <!-- Today's Schedule -->
+    <div class="card">
+      <h2><span class="icon" style="background:var(--green-bg);color:var(--green);">&#128197;</span> Today</h2>
+      <div class="day-header">
+        <span id="dayDate">—</span>
+        <button type="button" id="refreshDayBtn" class="btn-default">Refresh</button>
+      </div>
+      <div id="dayEvents" class="day-events">Loading...</div>
     </div>
 
     <!-- Settings -->
@@ -646,9 +724,12 @@ PAGE_HTML = """
 
     async function refreshConn() {
       const d = await checkStatus();
-      $('status').textContent = d.serial_connected
-        ? 'ESP32 connected via serial'
-        : 'No ESP32 — audio stored locally (no echo)';
+      const parts = [];
+      if (d.wifi_connected) parts.push('WiFi (' + d.esp32_ip + ')');
+      if (d.serial_connected) parts.push('Serial');
+      $('status').textContent = parts.length
+        ? 'ESP32: ' + parts.join(' + ')
+        : 'No ESP32 connected';
     }
 
     /* ---- Hold to Record ---- */
@@ -689,20 +770,50 @@ PAGE_HTML = """
       mediaRecorder.stop();
     }
 
+    function appendDebugLog(entries) {
+      if (Array.isArray(entries)) entries.forEach(log);
+    }
+
+    let debugLogPollTimer = null;
+    async function fetchServerDebugLog() {
+      try {
+        const r = await fetch('/api/debug/log?n=100');
+        const d = await r.json();
+        if (d.entries && d.entries.length) {
+          $('log').textContent = d.entries.join('\\n');
+          $('log').scrollTop = $('log').scrollHeight;
+        }
+      } catch (_) {}
+    }
+    function toggleDebugLog(el) {
+      const logEl = $('log');
+      logEl.classList.toggle('open');
+      el.querySelector('span').textContent = logEl.classList.contains('open') ? '&#9660;' : '&#9654;';
+      if (logEl.classList.contains('open')) {
+        fetchServerDebugLog();
+        debugLogPollTimer = setInterval(fetchServerDebugLog, 2000);
+      } else {
+        if (debugLogPollTimer) clearInterval(debugLogPollTimer);
+        debugLogPollTimer = null;
+      }
+    }
+
     async function sendToEsp32(blob) {
       const fd = new FormData();
       fd.append('audio', blob, 'recording.webm');
       if (recordStartTime) fd.append('start_time', recordStartTime);
 
-      setStatus('Sending to ESP32 for echo + transcription...');
-      log('Uploading audio...');
+      setStatus('Sending to server (browser → HTTP)...');
+      log('Uploading audio via HTTP (browser → server)...');
 
       try {
         const r = await fetch('/api/record/send_to_esp32', { method: 'POST', body: fd });
         const data = await r.json();
 
+        if (data.debug_log) appendDebugLog(data.debug_log);
+
         if (data.ok) {
-          log(data.local ? 'No ESP32 — processed locally.' : 'ESP32 echo received.');
+          log('Processed locally (browser → server HTTP, no ESP32 round-trip).');
 
           if (data.transcript) {
             log('Transcript: ' + data.transcript);
@@ -719,6 +830,7 @@ PAGE_HTML = """
           }
 
           playLastAudio();
+          refreshDayCalendar();
         } else {
           setStatus('Error: ' + (data.error || 'unknown'));
           log('Error: ' + (data.error || JSON.stringify(data)));
@@ -745,15 +857,55 @@ PAGE_HTML = """
     /* ---- Ping ---- */
 
     async function onPing() {
-      setStatus('Pinging ESP32...');
-      log('Sending PING...');
+      setStatus('Pinging ESP32 (WiFi)...');
+      log('Sending PING via HTTP (server → ESP32 WiFi)...');
       try {
         const r = await fetch('/api/ping', { method: 'POST' });
         const d = await r.json();
+        if (d.debug_log) appendDebugLog(d.debug_log);
         setStatus(d.ok ? 'ESP32 responded (PONG).' : 'No response from ESP32.');
-        log(d.ok ? 'PONG received!' : (d.error || d.message || 'Timeout'));
+        log(d.ok ? 'PONG received (WiFi)!' : (d.error || d.message || 'Timeout'));
       } catch (err) {
         setStatus('Error: ' + err.message);
+      }
+    }
+
+    /* ---- Today's Schedule ---- */
+
+    function formatEventTime(s) {
+      if (!s || s.length === 10) return 'All day';
+      try {
+        const d = new Date(s.replace('Z', '+00:00'));
+        return d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+      } catch (_) { return s; }
+    }
+
+    async function refreshDayCalendar() {
+      const el = $('dayEvents');
+      const dateEl = $('dayDate');
+      try {
+        const r = await fetch('/api/calendar/day');
+        const d = await r.json();
+        if (!d.ok) {
+          el.textContent = d.error || 'Error loading calendar';
+          dateEl.textContent = '—';
+          return;
+        }
+        dateEl.textContent = d.date ? new Date(d.date + 'T12:00:00Z').toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' }) : '—';
+        if (!d.events || d.events.length === 0) {
+          el.innerHTML = '<span style="color:var(--text2);">No events today</span>';
+          return;
+        }
+        el.innerHTML = d.events.map(ev => {
+          const start = formatEventTime(ev.start);
+          const end = formatEventTime(ev.end);
+          const timeStr = start === 'All day' ? 'All day' : (start + ' – ' + end);
+          const summary = (ev.summary || '(no title)').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+          return '<div class="day-event"><span class="day-event-summary">' + summary + '</span><span class="day-event-time">' + timeStr + '</span></div>';
+        }).join('');
+      } catch (err) {
+        el.textContent = 'Failed to load';
+        dateEl.textContent = '—';
       }
     }
 
@@ -763,9 +915,11 @@ PAGE_HTML = """
       setStatus('Repeating last activity...');
       const r = await fetch('/api/trigger/repeat', { method: 'POST' });
       const d = await r.json();
+      if (d.debug_log) appendDebugLog(d.debug_log);
       if (d.ok) {
         setStatus('Repeated: ' + (d.event_name || '') + (d.event_id ? ' (added to calendar)' : ''));
         log('Repeated "' + (d.event_name || '') + '"' + (d.event_id ? ' → event ' + d.event_id : ''));
+        refreshDayCalendar();
       } else {
         setStatus(d.error || 'No previous activity');
         log('Repeat error: ' + (d.error || 'unknown'));
@@ -776,9 +930,11 @@ PAGE_HTML = """
       setStatus('Logging favorite...');
       const r = await fetch('/api/trigger/favorite', { method: 'POST' });
       const d = await r.json();
+      if (d.debug_log) appendDebugLog(d.debug_log);
       if (d.ok) {
         setStatus('Favorite: ' + (d.event_name || '') + (d.event_id ? ' (added to calendar)' : ''));
         log('Favorite "' + (d.event_name || '') + '"' + (d.event_id ? ' → event ' + d.event_id : ''));
+        refreshDayCalendar();
       } else {
         setStatus(d.error || 'Error');
         log('Favorite error: ' + (d.error || 'unknown'));
@@ -828,6 +984,8 @@ PAGE_HTML = """
       });
 
       $('pingBtn')?.addEventListener('click', onPing);
+      $('refreshDayBtn')?.addEventListener('click', refreshDayCalendar);
+      refreshDayCalendar();
       $('repeatBtn')?.addEventListener('click', onRepeat);
       $('favoriteBtn')?.addEventListener('click', onFavorite);
 
@@ -914,6 +1072,26 @@ def auth_callback():
 # ---------------------------------------------------------------------------
 
 
+@app.route("/api/calendar/now", methods=["POST"])
+def api_calendar_now():
+    """Return events happening right now, with duplicate detection."""
+    try:
+        result = handle_current_events()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/calendar/day")
+def api_calendar_day():
+    """Return all events for the current day (UTC)."""
+    try:
+        result = handle_today_events()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
 @app.route("/api/settings", methods=["GET"])
 def get_settings():
     return jsonify(load())
@@ -947,30 +1125,65 @@ def post_settings():
 @app.route("/api/status")
 def api_status():
     with _ser_lock:
-        connected = _ser is not None and _ser.is_open
+        serial_ok = _ser is not None and _ser.is_open
+    wifi_ok = _esp32_wifi_ip is not None and (time.time() - _esp32_wifi_last_seen < 300)
     return jsonify({
-        "serial_connected": connected,
+        "serial_connected": serial_ok,
+        "wifi_connected": wifi_ok,
+        "esp32_ip": _esp32_wifi_ip if wifi_ok else None,
         "last_activity": _last_activity,
     })
 
 
 @app.route("/api/ping", methods=["POST"])
 def api_ping():
-    global _expecting_pong
-    if not send_line("PING"):
-        return jsonify({"ok": False, "error": "No serial connection"})
-    _expecting_pong = True
-    _pong_event.clear()
-    ok = _pong_event.wait(timeout=3.0)
-    _expecting_pong = False
-    return jsonify({"ok": ok, "message": "PONG received" if ok else "Timeout"})
+    """Ping ESP32 over WiFi (HTTP GET to ESP32's /ping endpoint)."""
+    import requests as req_lib
+    log_ = []
+    src = "browser"
+
+    if not _esp32_wifi_ip:
+        msg = "Ping: ESP32 WiFi IP unknown (register or record first)"
+        log_.append(f"[{src}] {msg}")
+        _debug(msg, src)
+        return jsonify({"ok": False, "error": "ESP32 WiFi IP not known yet (record something first)", "debug_log": log_})
+    msg = f"Ping: sending HTTP GET to ESP32 at {_esp32_wifi_ip}/ping (WiFi)"
+    log_.append(f"[{src}] {msg}")
+    _debug(msg, src)
+    try:
+        r = req_lib.get(f"http://{_esp32_wifi_ip}/ping", timeout=3)
+        data = r.json()
+        msg = f"Ping: ESP32 responded PONG (WiFi, status={r.status_code})"
+        log_.append(f"[{src}] {msg}")
+        _debug(msg, src)
+        return jsonify({"ok": data.get("ok", False),
+                        "message": data.get("message", "PONG"),
+                        "esp32_ip": _esp32_wifi_ip,
+                        "debug_log": log_})
+    except req_lib.ConnectionError:
+        log_.append(f"[{src}] Ping: connection failed to {_esp32_wifi_ip}")
+        _debug(log_[-1], src)
+        return jsonify({"ok": False, "error": f"Cannot reach ESP32 at {_esp32_wifi_ip}", "debug_log": log_})
+    except req_lib.Timeout:
+        log_.append(f"[{src}] Ping: timeout waiting for ESP32 at {_esp32_wifi_ip}")
+        _debug(log_[-1], src)
+        return jsonify({"ok": False, "error": f"Timeout pinging ESP32 at {_esp32_wifi_ip}", "debug_log": log_})
 
 
 @app.route("/api/trigger/repeat", methods=["POST"])
 def api_trigger_repeat():
     """Re-create the last activity as a new calendar event starting now."""
+    log_ = []
+    src = "esp32_wifi" if _esp32_wifi_ip and request.remote_addr == _esp32_wifi_ip else "browser"
+
     if not _last_activity:
-        return jsonify({"ok": False, "error": "No previous activity to repeat"})
+        msg = "Repeat: no previous activity (HTTP from browser)"
+        log_.append(f"[{src}] {msg}")
+        _debug(msg, src)
+        return jsonify({"ok": False, "error": "No previous activity to repeat", "debug_log": log_})
+    msg = f"Repeat: re-creating \"{_last_activity['event_name']}\" via HTTP"
+    log_.append(f"[{src}] {msg}")
+    _debug(msg, src)
     s = load()
     dur = s.get("event_duration", DEFAULTS["event_duration"])
     try:
@@ -979,29 +1192,55 @@ def api_trigger_repeat():
             _last_activity["transcript"],
             dur,
         )
+        if result.get("ok"):
+            msg = f"Repeat: created event {result.get('event_id', '')}"
+        else:
+            msg = f"Repeat: calendar error {result.get('error', '')}"
+        log_.append(f"[{src}] {msg}")
+        _debug(msg, src)
         return jsonify({"ok": result.get("ok"),
                         "event_name": _last_activity["event_name"],
                         "event_id": result.get("event_id", ""),
-                        "error": result.get("error")})
+                        "error": result.get("error"),
+                        "debug_log": log_})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
+        msg = f"Repeat: exception {e}"
+        log_.append(f"[{src}] {msg}")
+        _debug(msg, src)
+        return jsonify({"ok": False, "error": str(e), "debug_log": log_})
 
 
 @app.route("/api/trigger/favorite", methods=["POST"])
 def api_trigger_favorite():
     """Create a calendar event using the favorite name/desc from settings."""
+    log_ = []
+    src = "esp32_wifi" if _esp32_wifi_ip and request.remote_addr == _esp32_wifi_ip else "browser"
+
     s = load()
     dur = s.get("event_duration", DEFAULTS["event_duration"])
     name = s.get("favorite_name", "Focus Work")
     desc = s.get("favorite_desc", "")
+    msg = f"Favorite: creating \"{name}\" ({dur} min) via HTTP"
+    log_.append(f"[{src}] {msg}")
+    _debug(msg, src)
     try:
         result = handle_create_event(name, desc, dur)
+        if result.get("ok"):
+            msg = f"Favorite: created event {result.get('event_id', '')}"
+        else:
+            msg = f"Favorite: calendar error {result.get('error', '')}"
+        log_.append(f"[{src}] {msg}")
+        _debug(msg, src)
         return jsonify({"ok": result.get("ok"),
                         "event_name": name,
                         "event_id": result.get("event_id", ""),
-                        "error": result.get("error")})
+                        "error": result.get("error"),
+                        "debug_log": log_})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
+        msg = f"Favorite: exception {e}"
+        log_.append(f"[{src}] {msg}")
+        _debug(msg, src)
+        return jsonify({"ok": False, "error": str(e), "debug_log": log_})
 
 
 # ---------------------------------------------------------------------------
@@ -1011,19 +1250,28 @@ def api_trigger_favorite():
 
 @app.route("/api/record/send_to_esp32", methods=["POST"])
 def api_record_send_to_esp32():
-    """Record → echo → transcribe → interpret → create calendar event."""
-    global _expecting_echo, _echo_audio, _echo_mime, _last_activity
+    """Browser record → store audio → transcribe → interpret → calendar.
+    No serial echo — audio stays on server for playback."""
+    global _echo_audio, _echo_mime, _last_activity
 
-    from datetime import datetime, timedelta
+    from datetime import datetime
+
+    log_ = []
+    src = "browser"
 
     f = request.files.get("audio")
     if not f:
-        return jsonify({"ok": False, "error": "No audio file"}), 400
+        _debug("Record: no audio file in request", src)
+        return jsonify({"ok": False, "error": "No audio file", "debug_log": log_}), 400
     audio_bytes = f.read()
     if not audio_bytes:
-        return jsonify({"ok": False, "error": "Empty audio"}), 400
+        _debug("Record: empty audio", src)
+        return jsonify({"ok": False, "error": "Empty audio", "debug_log": log_}), 400
 
-    # Parse the recording start time sent by the browser
+    msg = f"Record: received {len(audio_bytes)} bytes from browser (HTTP)"
+    log_.append(f"[{src}] {msg}")
+    _debug(msg, src)
+
     start_time_str = request.form.get("start_time", "")
     if start_time_str:
         try:
@@ -1035,65 +1283,77 @@ def api_record_send_to_esp32():
         record_start = datetime.utcnow()
 
     mime = f.content_type or "audio/webm"
-    local = False
 
-    _echo_audio = b""
+    # Store for browser playback (no serial round-trip)
+    _echo_audio = audio_bytes
     _echo_mime = mime
-    _echo_event.clear()
-    _expecting_echo = True
-
-    if not send_audio_to_esp32(audio_bytes):
-        _expecting_echo = False
-        _echo_audio = audio_bytes
-        _echo_mime = mime
-        local = True
-        print(f"[Echo] No ESP32, stored {len(audio_bytes)} bytes locally")
-    else:
-        if not _echo_event.wait(timeout=30):
-            _expecting_echo = False
-            return jsonify({"ok": False, "error": "Timeout waiting for ESP32 echo (30s)"})
+    msg = f"Record: stored {len(audio_bytes)} bytes for playback"
+    log_.append(f"[{src}] {msg}")
+    _debug(msg, src)
 
     # --- STT ---
-    audio_for_stt = _echo_audio
-    print(f"[STT] Transcribing {len(audio_for_stt)} bytes ({mime})...")
-    tr = handle_transcribe_bytes(audio_for_stt, mime)
+    msg = f"STT: transcribing {len(audio_bytes)} bytes ({mime})..."
+    log_.append(f"[{src}] {msg}")
+    _debug(msg, src)
+    tr = handle_transcribe_bytes(audio_bytes, mime)
     if not tr.get("ok"):
-        return jsonify({"ok": False, "local": local, "error": tr.get("error", "STT failed"),
-                        "transcript": "", "event_name": ""})
+        msg = f"STT failed: {tr.get('error', 'unknown')}"
+        log_.append(f"[{src}] {msg}")
+        _debug(msg, src)
+        return jsonify({"ok": False, "error": tr.get("error", "STT failed"),
+                        "transcript": "", "event_name": "", "debug_log": log_})
 
     transcript = tr.get("transcript", "")
     if not transcript:
-        return jsonify({"ok": True, "local": local, "transcript": "",
+        msg = "STT: no speech detected"
+        log_.append(f"[{src}] {msg}")
+        _debug(msg, src)
+        return jsonify({"ok": True, "transcript": "",
                         "event_name": "", "category": "",
-                        "message": "No speech detected"})
+                        "message": "No speech detected", "debug_log": log_})
+
+    msg = f"STT: transcript = \"{transcript[:60]}{'...' if len(transcript) > 60 else ''}\""
+    log_.append(f"[{src}] {msg}")
+    _debug(msg, src)
 
     # --- LLM interpret ---
-    print(f"[LLM] Interpreting: {transcript[:80]}")
+    msg = "LLM: interpreting transcript..."
+    log_.append(f"[{src}] {msg}")
+    _debug(msg, src)
     interp = handle_interpret(transcript)
     event_name = interp.get("event_name", transcript[:40])
     category = interp.get("category", "other")
+    msg = f"LLM: event_name=\"{event_name}\" category={category}"
+    log_.append(f"[{src}] {msg}")
+    _debug(msg, src)
 
     _last_activity = {"event_name": event_name, "transcript": transcript}
 
-    # --- Create Google Calendar event starting at recording time ---
+    # --- Create Google Calendar event ---
     s = load()
     dur = s.get("event_duration", DEFAULTS["event_duration"])
-    print(f"[Cal] Creating event '{event_name}' at {record_start.isoformat()} ({dur} min)")
+    msg = f"Cal: creating event at {record_start.isoformat()} ({dur} min)"
+    log_.append(f"[{src}] {msg}")
+    _debug(msg, src)
     cal = handle_create_event(event_name, transcript, dur, start=record_start)
 
     result = {
         "ok": True,
-        "local": local,
         "transcript": transcript,
         "event_name": event_name,
         "category": category,
+        "debug_log": log_,
     }
     if cal.get("ok"):
         result["event_id"] = cal["event_id"]
-        print(f"[Cal] Created event {cal['event_id']}")
+        msg = f"Cal: created event {cal['event_id']}"
+        log_.append(f"[{src}] {msg}")
+        _debug(msg, src)
     else:
         result["cal_error"] = cal.get("error", "Calendar failed")
-        print(f"[Cal] Error: {result['cal_error']}")
+        msg = f"Cal: error {result['cal_error']}"
+        log_.append(f"[{src}] {msg}")
+        _debug(msg, src)
 
     return jsonify(result)
 
@@ -1106,9 +1366,96 @@ def api_audio_last():
                     headers={"Cache-Control": "no-store"})
 
 
+@app.route("/api/debug/log")
+def api_debug_log():
+    """Return recent server debug log (browser, esp32_wifi, serial activity)."""
+    n = min(int(request.args.get("n", 50)), 100)
+    return jsonify({"entries": _debug_log[-n:], "total": len(_debug_log)})
+
+
 @app.route("/debug")
 def debug_redirect():
     return redirect("/")
+
+
+# ---------------------------------------------------------------------------
+# ESP32 WiFi endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/esp32/register", methods=["POST"])
+def api_esp32_register():
+    """ESP32 calls this on boot to announce its WiFi IP."""
+    src = "esp32_wifi"
+    ip = request.remote_addr
+    _update_esp32_wifi(ip)
+    _debug(f"Register: ESP32 POST from {ip} (WiFi) — stored as ESP32 IP", src)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/esp32/record", methods=["POST"])
+def api_esp32_record():
+    """ESP32 posts raw WAV audio over WiFi. Server does STT → interpret → calendar."""
+    global _last_activity
+
+    from datetime import datetime
+
+    src = "esp32_wifi"
+    ip = request.remote_addr
+
+    audio_bytes = request.get_data()
+    if not audio_bytes:
+        _debug("Record (ESP32): no audio data in POST body", src)
+        return jsonify({"ok": False, "error": "No audio data"}), 400
+
+    content_type = request.content_type or "audio/wav"
+    record_start = datetime.utcnow()
+
+    _update_esp32_wifi(ip)
+    _debug(f"Record (ESP32): received {len(audio_bytes)} bytes from {ip} via WiFi HTTP ({content_type})", src)
+
+    _debug(f"Record (ESP32): STT transcribing {len(audio_bytes)} bytes...", src)
+    tr = handle_transcribe_bytes(audio_bytes, content_type)
+    if not tr.get("ok"):
+        _debug(f"Record (ESP32): STT failed {tr.get('error', '')}", src)
+        return jsonify({"ok": False, "error": tr.get("error", "STT failed"),
+                        "transcript": "", "event_name": ""})
+
+    transcript = tr.get("transcript", "")
+    if not transcript:
+        _debug("Record (ESP32): no speech detected", src)
+        return jsonify({"ok": True, "transcript": "", "event_name": "",
+                        "message": "No speech detected"})
+
+    _debug(f"Record (ESP32): transcript=\"{transcript[:60]}{'...' if len(transcript) > 60 else ''}\"", src)
+
+    _debug("Record (ESP32): LLM interpreting...", src)
+    interp = handle_interpret(transcript)
+    event_name = interp.get("event_name", transcript[:40])
+    category = interp.get("category", "other")
+    _debug(f"Record (ESP32): event_name=\"{event_name}\" category={category}", src)
+
+    _last_activity = {"event_name": event_name, "transcript": transcript}
+
+    s = load()
+    dur = s.get("event_duration", DEFAULTS["event_duration"])
+    _debug(f"Record (ESP32): creating calendar event ({dur} min)", src)
+    cal = handle_create_event(event_name, transcript, dur, start=record_start)
+
+    result = {
+        "ok": True,
+        "transcript": transcript,
+        "event_name": event_name,
+        "category": category,
+    }
+    if cal.get("ok"):
+        result["event_id"] = cal["event_id"]
+        _debug(f"Record (ESP32): created event {cal['event_id']}", src)
+    else:
+        result["error"] = cal.get("error", "Calendar failed")
+        _debug(f"Record (ESP32): calendar error {result['error']}", src)
+
+    return jsonify(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1133,8 +1480,11 @@ def main():
     else:
         print("[Info] --no-serial: skipping serial connection")
 
+    import socket
+    local_ip = socket.gethostbyname(socket.gethostname())
     print(f"[Info] Web UI: http://localhost:5000")
-    app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
+    print(f"[Info] ESP32 endpoint: http://{local_ip}:5000/api/esp32/record")
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
 
 
 if __name__ == "__main__":

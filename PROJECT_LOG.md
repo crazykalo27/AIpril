@@ -84,3 +84,59 @@ Conceptual notes on changes and project status.
 - Duration defaults to 30 min, configurable 5–480 in the UI
 
 **Status**: All three buttons (Record, Repeat, Favorite) create real Google Calendar events with configurable duration.
+
+## 2026-03-15 — WiFi Communication (Serial kept for debug)
+
+**Goal**: ESP32 sends audio and commands to server over WiFi HTTP, not serial. Serial kept for debug output.
+
+**ESP32 changes**:
+- New `secrets.h` with WIFI_SSID, WIFI_PASSWORD, SERVER_URL
+- `main.cpp` connects to WiFi on boot, reconnects if dropped
+- New `HttpClient` class (WiFi + HTTPClient) replaces serial-based `WireClient`
+- `handleVoiceCapture()` records audio → HTTP POST raw WAV to `/api/esp32/record`
+- `handleRepeat()` and `handleFavorite()` POST to existing server endpoints
+- Serial still active for debug prints and manual commands (record, repeat, status, help)
+- I2S DIN moved to pin 34 (pin 33 used for repeat button)
+
+**Server changes**:
+- New `/api/esp32/record` endpoint accepts raw WAV bytes, runs STT → interpret → calendar
+- Server binds to `0.0.0.0:5000` so ESP32 can reach it over the local network
+- Prints local IP on startup for easy `SERVER_URL` configuration
+- Serial thread still runs for debug monitoring and browser echo pipeline
+
+**Status**: Dual communication — WiFi for ESP32 data, serial for debugging. Browser UI unchanged.
+
+## 2026-03-15 — Server Debug Logging
+
+**Goal**: More verbose debug output for each step, visible in the web UI debug log and server console.
+
+**Changes**:
+- Added `_debug()` helper and `_debug_log` buffer (last 100 entries)
+- All API handlers log step-by-step with source: `browser`, `esp32_wifi`, or `serial`
+- Record flow: receive → store → STT → LLM → calendar (each step logged)
+- Ping: HTTP GET to ESP32 WiFi, response logged
+- Repeat/Favorite: source detected (browser vs esp32_wifi by IP)
+- ESP32 register/record: full pipeline logged with `esp32_wifi` source
+- Serial: RX lines, PONG, REPEAT, AUDIO, commands logged with `serial` source
+- New `/api/debug/log` endpoint returns recent entries
+- Debug log panel: when opened, polls server every 2s to show ESP32 activity
+- API responses include `debug_log` array; client appends to UI log
+
+## 2026-03-15 — One-Day Calendar View
+
+**Goal**: Replace "What's On Now" with a full-day calendar view.
+
+**Changes**:
+- New `handle_today_events()` in handlers.py — fetches all events for current day (UTC)
+- New `/api/calendar/day` endpoint
+- New "Today" card: shows date, event list (chronological), Refresh button
+- Auto-refresh when adding event via Record, Repeat, or Favorite
+
+## 2026-03-15 — Repeat Button Pin 25, Ping Beep on Pin 33
+
+**Goal**: Move repeat button to pin 25; beep speaker on pin 33 when ping received.
+
+**Changes**:
+- Repeat button: pin 33 → 25 (I2S LRCK moved to 15 to free 25)
+- Pin 33: PWM speaker for ping beep (ledc channel 1)
+- Beep on both HTTP /ping and serial PING

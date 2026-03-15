@@ -8,19 +8,22 @@
 
 // --- I2S Microphone (INMP441) ---
 #define PIN_I2S_BCLK    26
-#define PIN_I2S_LRCK    25
-#define PIN_I2S_DIN     33
+#define PIN_I2S_LRCK    15   // Moved from 25 to free it for repeat button
+#define PIN_I2S_DIN     34   // Input-only pin, fine for I2S data in
 
 // --- Buzzer ---
 #define PIN_BUZZER      27
 
-// --- Buttons ---
-// Use pins with internal pull-up (GPIO 34, 35, 36, 39 are input-only, no pull-up)
-#define PIN_BTN_VOICE     0   // BOOT button on most ESP32 boards
-#define PIN_BTN_REPEAT   32
-#define PIN_BTN_FAVORITE 14   // was 35 (no internal pull-up); 14 has pull-up
+// --- Ping speaker (PWM beep when server pings) ---
+#define PIN_PING_SPEAKER  33
 
-// --- Status LED (optional) ---
-#define PIN_LED          2    // Built-in LED on most boards
+// --- Buttons ---
+#define PIN_BTN_VOICE     0  // BOOT button on most ESP32 boards
+#define PIN_BTN_REPEAT   25  // Pushbutton to GND (was 33)
+#define PIN_BTN_FAVORITE 14
+
+// --- LEDs ---
+#define PIN_LED            2 // Built-in LED
+#define PIN_LED_REPEAT    32 // Flashes on repeat
 
 #endif
