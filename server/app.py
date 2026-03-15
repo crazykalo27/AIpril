@@ -780,36 +780,39 @@ PAGE_HTML = """
     /* ---- Remote record (ESP32 button → computer mic) ---- */
 
     let remoteWasRecording = false;
-    let remoteStream = null;
+    let persistentStream = null;
+
+    async function acquireMic() {
+      if (persistentStream) return;
+      try {
+        persistentStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        log('Mic pre-acquired (ready for ESP32 button).');
+      } catch (err) {
+        log('Mic pre-acquire failed: ' + err.message);
+      }
+    }
 
     function startRemoteRecord() {
       if (mediaRecorder && mediaRecorder.state === 'recording') return;
+      if (!persistentStream) {
+        log('No mic stream — click page first to grant permission.');
+        return;
+      }
       $('log').textContent = '';
       setStatus('Recording (ESP32 button)...');
       $('recordBtn').classList.add('recording');
-      log('ESP32 button held — starting mic...');
-
-      navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-        remoteStream = stream;
-        audioChunks = [];
-        mediaRecorder = new MediaRecorder(stream);
-        mediaRecorder.ondataavailable = ev => { if (ev.data.size) audioChunks.push(ev.data); };
-        mediaRecorder.onstop = () => {
-          stream.getTracks().forEach(t => t.stop());
-          remoteStream = null;
-          $('recordBtn').classList.remove('recording');
-          const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-          log('Recording stopped (' + blob.size + ' bytes). Sending to server...');
-          sendToEsp32(blob);
-        };
-        mediaRecorder.start();
-        recordStartTime = new Date().toISOString();
-        log('Recording from computer mic (ESP32 button held)...');
-      }).catch(err => {
+      audioChunks = [];
+      mediaRecorder = new MediaRecorder(persistentStream);
+      mediaRecorder.ondataavailable = ev => { if (ev.data.size) audioChunks.push(ev.data); };
+      mediaRecorder.onstop = () => {
         $('recordBtn').classList.remove('recording');
-        setStatus('Mic error: ' + err.message);
-        log('getUserMedia error: ' + err);
-      });
+        const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+        log('Recording stopped (' + blob.size + ' bytes). Sending to server...');
+        sendToEsp32(blob);
+      };
+      mediaRecorder.start();
+      recordStartTime = new Date().toISOString();
+      log('Recording from computer mic (ESP32 button held)...');
     }
 
     function stopRemoteRecord() {
@@ -832,7 +835,7 @@ PAGE_HTML = """
       } catch (_) {}
     }
 
-    setInterval(pollRemoteRecord, 250);
+    setInterval(pollRemoteRecord, 100);
 
     let debugLogPollTimer = null;
     async function fetchServerDebugLog() {
@@ -1059,6 +1062,7 @@ PAGE_HTML = """
       }
 
       refreshConn();
+      acquireMic();
     }
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
