@@ -1,16 +1,75 @@
-"""Google OAuth2 and Calendar API helpers."""
+"""Google OAuth2 and Calendar API helpers.
+
+Web-based flow: /auth/start → Google consent → /auth/callback → token.json.
+"""
 from pathlib import Path
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
+_flow: Flow | None = None
+
+
+def is_authenticated(token_file: Path) -> bool:
+    """Check if token.json exists with valid or refreshable credentials."""
+    if not token_file.exists():
+        return False
+    try:
+        creds = Credentials.from_authorized_user_file(str(token_file), SCOPES)
+        if creds.valid:
+            return True
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            with open(token_file, "w") as f:
+                f.write(creds.to_json())
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def get_auth_url(credentials_file: Path, redirect_uri: str) -> str | None:
+    """Create OAuth flow and return the Google authorization URL."""
+    global _flow
+    if not credentials_file.exists():
+        return None
+    _flow = Flow.from_client_secrets_file(
+        str(credentials_file),
+        scopes=SCOPES,
+        redirect_uri=redirect_uri,
+    )
+    auth_url, _ = _flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
+    return auth_url
+
+
+def handle_auth_callback(code: str, token_file: Path) -> bool:
+    """Exchange authorization code for tokens. Returns True on success."""
+    global _flow
+    if not _flow:
+        return False
+    try:
+        _flow.fetch_token(code=code)
+        creds = _flow.credentials
+        with open(token_file, "w") as f:
+            f.write(creds.to_json())
+        _flow = None
+        return True
+    except Exception as e:
+        print(f"[Auth] Token exchange failed: {e}")
+        _flow = None
+        return False
+
 
 def get_credentials(credentials_file: Path, token_file: Path) -> Credentials | None:
-    """Load or refresh Google credentials."""
+    """Load or refresh Google credentials. Returns None if not authenticated."""
     creds = None
     if token_file.exists():
         creds = Credentials.from_authorized_user_file(str(token_file), SCOPES)
@@ -18,9 +77,6 @@ def get_credentials(credentials_file: Path, token_file: Path) -> Credentials | N
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-        elif credentials_file.exists():
-            flow = InstalledAppFlow.from_client_secrets_file(str(credentials_file), SCOPES)
-            creds = flow.run_local_server(port=0)
         else:
             return None
 
@@ -54,7 +110,7 @@ def list_calendar_events(
     time_min: str,
     time_max: str,
 ) -> list[dict]:
-    """List calendar events in time range. Returns list of {id, summary, start, end}."""
+    """List calendar events in time range."""
     service = build("calendar", "v3", credentials=creds)
     events_result = (
         service.events()

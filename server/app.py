@@ -2,10 +2,8 @@
 AIpril server — web UI + serial bridge.
 
 Web UI at http://localhost:5000 for settings and audio echo testing.
+Google Calendar OAuth must be completed before features are usable.
 Serial listener runs in background for ESP32 (use --no-serial to skip).
-
-Echo pipeline: browser records → server sends bytes to ESP32 → ESP32 echoes
-back → server stores audio → browser plays /api/audio/last.
 """
 
 import base64
@@ -17,7 +15,7 @@ import time
 import serial
 from flask import Flask, Response, jsonify, redirect, render_template_string, request, url_for
 
-from config import SERIAL_PORT, SERIAL_BAUD
+from config import SERIAL_PORT, SERIAL_BAUD, CREDENTIALS_FILE, TOKEN_FILE
 from handlers import (
     handle_transcribe,
     handle_transcribe_bytes,
@@ -26,13 +24,14 @@ from handlers import (
     handle_create_favorite,
     handle_list_events,
 )
+from google_auth import is_authenticated, get_auth_url, handle_auth_callback
 from settings import load, save, get_interpret_prompt, DEFAULTS
 from debug_handlers import debug_transcribe_from_file, debug_full_flow
 
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Shared state (accessed from HTTP handler threads + serial loop thread)
+# Shared state
 # ---------------------------------------------------------------------------
 
 _ser: serial.Serial | None = None
@@ -40,13 +39,11 @@ _ser_lock = threading.Lock()
 
 _last_activity: dict | None = None
 
-# Echo pipeline state
 _expecting_echo = False
 _echo_audio: bytes = b""
 _echo_mime: str = "audio/webm"
 _echo_event = threading.Event()
 
-# Ping state
 _expecting_pong = False
 _pong_event = threading.Event()
 
@@ -91,7 +88,6 @@ def send_response(ser: serial.Serial, obj: dict) -> None:
 
 
 def process_audio_binary(ser: serial.Serial, line: str) -> None:
-    """Handle 'AUDIO <len>' header from ESP32, read binary payload."""
     global _expecting_echo, _echo_audio, _last_activity
 
     parts = line.split()
@@ -120,7 +116,6 @@ def process_audio_binary(ser: serial.Serial, line: str) -> None:
         print(f"[Echo] Received {len(audio)} bytes back from ESP32")
         return
 
-    # Normal path: ESP32 recorded from mic, run transcription
     audio_b64 = base64.b64encode(audio).decode("ascii")
     resp = {**{"cmd": "transcribe"}, **handle_transcribe(audio_b64)}
     send_response(ser, resp)
@@ -235,8 +230,13 @@ PAGE_HTML = """
     textarea { min-height: 80px; }
     button { margin-top: 0.5rem; padding: 0.5rem 1rem; cursor: pointer; min-height: 44px;
              touch-action: manipulation; }
-    .labels { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.25rem; }
-    .labels input { width: auto; flex: 1; min-width: 120px; }
+    .label-list { max-height: 180px; overflow-y: auto; margin-top: 0.25rem; border: 1px solid #ddd;
+                   border-radius: 4px; padding: 0.25rem; }
+    .label-row { display: flex; align-items: center; gap: 0.25rem; margin: 0.25rem 0; }
+    .label-row input { flex: 1; margin: 0; }
+    .label-row .btn-del { min-height: 0; min-width: 0; margin: 0; padding: 0.25rem 0.5rem;
+                          background: #e53935; color: white; border: none; border-radius: 3px;
+                          font-size: 0.8rem; cursor: pointer; }
     .msg { margin-top: 0.5rem; padding: 0.5rem; background: #e8f5e9; border-radius: 4px; }
     .err { background: #ffebee; }
     .section { margin-bottom: 1.5rem; padding-bottom: 1.5rem; border-bottom: 1px solid #eee; }
@@ -258,58 +258,113 @@ PAGE_HTML = """
            font-family: monospace; font-size: 11px; max-height: 200px; overflow-y: auto;
            border-radius: 4px; white-space: pre-wrap; }
     #audioPlayer { margin-top: 0.5rem; width: 100%; }
+
+    .auth-banner { padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1.5rem;
+                   display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+    .auth-ok { background: #e8f5e9; color: #2e7d32; border: 1px solid #c8e6c9; }
+    .auth-fail { background: #ffebee; color: #c62828; border: 1px solid #ffcdd2; }
+    .auth-checking { background: #f5f5f5; color: #666; border: 1px solid #e0e0e0; }
+    .auth-banner button { margin: 0; min-height: 36px; background: #1565c0; color: white;
+                          border: none; border-radius: 4px; padding: 0.4rem 1rem; }
+    #appContent.locked { opacity: 0.35; pointer-events: none; user-select: none; }
   </style>
 </head>
 <body>
   <h1>AIpril</h1>
 
-  <div class="section">
-    <h2>Audio Echo Test</h2>
-    <p id="status">{{ conn_status }}</p>
-
-    <div class="btn-row">
-      <button type="button" id="pingBtn" class="btn-default">Ping ESP32</button>
-      <button type="button" id="recordBtn" class="btn-record">Hold to Record</button>
-      <button type="button" id="repeatBtn" class="btn-repeat">Repeat</button>
-      <button type="button" id="favoriteBtn" class="btn-favorite">Favorite</button>
-    </div>
-
-    <div id="result" class="empty">
-      Record → ESP32 echo → transcribe → extract activity.
-    </div>
-
-    <audio id="audioPlayer" controls style="display:none;"></audio>
-
-    <h3>Log</h3>
-    <div id="log">&mdash;</div>
+  <div id="authBanner" class="auth-banner auth-checking">
+    <span id="authText">Checking Google Calendar authentication...</span>
   </div>
 
-  <div class="section">
-    <h2>Settings</h2>
-    <form id="form" method="POST" action="/api/settings">
-      <label>Favorite event name</label>
-      <input name="favorite_name" value="{{ favorite_name }}" placeholder="Focus Work">
-      <label>Favorite event description</label>
-      <textarea name="favorite_desc" placeholder="Deep focus block">{{ favorite_desc }}</textarea>
-      <label>Event labels (LLM matches transcript to these)</label>
-      <div class="labels" id="labels">
-        {% for l in event_labels %}
-        <input type="text" name="label" value="{{ l }}">
-        {% endfor %}
+  <div id="appContent" class="locked">
+
+    <div class="section">
+      <h2>Audio Echo Test</h2>
+      <p id="status">{{ conn_status }}</p>
+
+      <div class="btn-row">
+        <button type="button" id="pingBtn" class="btn-default">Ping ESP32</button>
+        <button type="button" id="recordBtn" class="btn-record">Hold to Record</button>
+        <button type="button" id="repeatBtn" class="btn-repeat">Repeat</button>
+        <button type="button" id="favoriteBtn" class="btn-favorite">Favorite</button>
       </div>
-      <button type="button" id="addLabelBtn">+ Add label</button>
-      <button type="submit">Save</button>
-    </form>
-    <div id="msg"></div>
+
+      <div id="result" class="empty">
+        Record → ESP32 echo → transcribe → extract activity.
+      </div>
+
+      <audio id="audioPlayer" controls style="display:none;"></audio>
+
+      <h3>Log</h3>
+      <div id="log">&mdash;</div>
+    </div>
+
+    <div class="section">
+      <h2>Settings</h2>
+      <form id="form" method="POST" action="/api/settings">
+        <label>Favorite event name</label>
+        <input name="favorite_name" value="{{ favorite_name }}" placeholder="Focus Work">
+        <label>Favorite event description</label>
+        <textarea name="favorite_desc" placeholder="Deep focus block">{{ favorite_desc }}</textarea>
+        <label>Event duration (minutes)</label>
+        <input name="event_duration" type="number" min="5" max="480" step="5"
+               value="{{ event_duration }}" style="width:120px;">
+        <label>Event labels (LLM matches transcript to these)</label>
+        <div class="label-list" id="labels">
+          {% for l in event_labels %}
+          <div class="label-row">
+            <input type="text" name="label" value="{{ l }}">
+            <button type="button" class="btn-del" onclick="this.parentElement.remove()">✕</button>
+          </div>
+          {% endfor %}
+        </div>
+        <button type="button" id="addLabelBtn">+ Add label</button>
+        <button type="submit">Save</button>
+      </form>
+      <div id="msg"></div>
+    </div>
+
   </div>
 
   <script>
     let mediaRecorder = null;
     let audioChunks = [];
+    let recordStartTime = null;
 
     const $ = id => document.getElementById(id);
     const log = msg => { $('log').textContent += '\\n' + msg; $('log').scrollTop = $('log').scrollHeight; };
     const setStatus = msg => $('result').textContent = msg;
+
+    /* ---- Auth ---- */
+
+    async function checkAuth() {
+      try {
+        const r = await fetch('/api/auth/status');
+        const d = await r.json();
+        const banner = $('authBanner');
+        const content = $('appContent');
+
+        if (d.authenticated) {
+          banner.className = 'auth-banner auth-ok';
+          banner.innerHTML = '<span>Google Calendar: Authenticated</span>';
+          content.classList.remove('locked');
+        } else {
+          banner.className = 'auth-banner auth-fail';
+          banner.innerHTML = '<span>' + (d.has_credentials
+            ? 'Google Calendar: Not authenticated'
+            : 'Google Calendar: Missing credentials.json') + '</span>'
+            + (d.has_credentials
+              ? '<button onclick="window.location.href=\\'/auth/start\\'">Authenticate with Google</button>'
+              : '');
+          content.classList.add('locked');
+        }
+      } catch (err) {
+        $('authBanner').className = 'auth-banner auth-fail';
+        $('authBanner').innerHTML = '<span>Could not check auth status</span>';
+      }
+    }
+
+    /* ---- Status ---- */
 
     async function checkStatus() {
       const r = await fetch('/api/status');
@@ -346,6 +401,7 @@ PAGE_HTML = """
           sendToEsp32(blob);
         };
         mediaRecorder.start();
+        recordStartTime = new Date().toISOString();
         log('Recording from mic (release button to stop)...');
       }).catch(err => {
         $('recordBtn').classList.remove('recording');
@@ -363,6 +419,7 @@ PAGE_HTML = """
     async function sendToEsp32(blob) {
       const fd = new FormData();
       fd.append('audio', blob, 'recording.webm');
+      if (recordStartTime) fd.append('start_time', recordStartTime);
 
       setStatus('Sending to ESP32 for echo + transcription...');
       log('Uploading audio...');
@@ -377,8 +434,11 @@ PAGE_HTML = """
           if (data.transcript) {
             log('Transcript: ' + data.transcript);
             log('Activity: ' + (data.event_name || '(none)') + ' (' + (data.category || '?') + ')');
+            if (data.event_id) log('Calendar event created: ' + data.event_id);
+            else if (data.cal_error) log('Calendar error: ' + data.cal_error);
             setStatus(data.event_name
               ? data.event_name + '  —  "' + data.transcript + '"'
+                + (data.event_id ? ' (added to calendar)' : '')
               : data.transcript);
           } else {
             setStatus(data.message || 'No speech detected.');
@@ -427,17 +487,29 @@ PAGE_HTML = """
     /* ---- Repeat / Favorite ---- */
 
     async function onRepeat() {
+      setStatus('Repeating last activity...');
       const r = await fetch('/api/trigger/repeat', { method: 'POST' });
       const d = await r.json();
-      setStatus(d.ok ? ('Repeated: ' + (d.event_name || '')) : (d.error || 'No previous activity'));
-      log(JSON.stringify(d));
+      if (d.ok) {
+        setStatus('Repeated: ' + (d.event_name || '') + (d.event_id ? ' (added to calendar)' : ''));
+        log('Repeated "' + (d.event_name || '') + '"' + (d.event_id ? ' → event ' + d.event_id : ''));
+      } else {
+        setStatus(d.error || 'No previous activity');
+        log('Repeat error: ' + (d.error || 'unknown'));
+      }
     }
 
     async function onFavorite() {
+      setStatus('Logging favorite...');
       const r = await fetch('/api/trigger/favorite', { method: 'POST' });
       const d = await r.json();
-      setStatus(d.ok ? 'Favorite logged.' : (d.error || 'Error'));
-      log(JSON.stringify(d));
+      if (d.ok) {
+        setStatus('Favorite: ' + (d.event_name || '') + (d.event_id ? ' (added to calendar)' : ''));
+        log('Favorite "' + (d.event_name || '') + '"' + (d.event_id ? ' → event ' + d.event_id : ''));
+      } else {
+        setStatus(d.error || 'Error');
+        log('Favorite error: ' + (d.error || 'unknown'));
+      }
     }
 
     /* ---- Settings form ---- */
@@ -452,7 +524,8 @@ PAGE_HTML = """
         const body = {
           favorite_name: fd.get('favorite_name') || '',
           favorite_desc: fd.get('favorite_desc') || '',
-          event_labels: labels.length ? labels : ['Focus Work', 'Meeting', 'Break']
+          event_duration: parseInt(fd.get('event_duration')) || 30,
+          event_labels: labels.length ? labels : ['Work', 'School']
         };
         const r = await fetch('/api/settings', {
           method: 'POST',
@@ -468,11 +541,17 @@ PAGE_HTML = """
     /* ---- Init ---- */
 
     function init() {
+      checkAuth();
+
       initForm();
       $('addLabelBtn')?.addEventListener('click', () => {
-        const inp = document.createElement('input');
-        inp.type = 'text'; inp.name = 'label'; inp.placeholder = 'New label';
-        $('labels').appendChild(inp);
+        const row = document.createElement('div');
+        row.className = 'label-row';
+        row.innerHTML = '<input type="text" name="label" placeholder="New label">'
+          + '<button type="button" class="btn-del" onclick="this.parentElement.remove()">✕</button>';
+        $('labels').appendChild(row);
+        row.querySelector('input').focus();
+        $('labels').scrollTop = $('labels').scrollHeight;
       });
 
       $('pingBtn')?.addEventListener('click', onPing);
@@ -514,12 +593,52 @@ def index():
         PAGE_HTML,
         favorite_name=s.get("favorite_name", ""),
         favorite_desc=s.get("favorite_desc", ""),
+        event_duration=s.get("event_duration", DEFAULTS["event_duration"]),
         event_labels=labels,
         conn_status=conn,
     )
     resp = app.make_response(resp)
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+# ---------------------------------------------------------------------------
+# Auth routes
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/auth/status")
+def api_auth_status():
+    authed = is_authenticated(TOKEN_FILE)
+    has_creds = CREDENTIALS_FILE.exists()
+    return jsonify({"authenticated": authed, "has_credentials": has_creds})
+
+
+@app.route("/auth/start")
+def auth_start():
+    """Redirect user to Google's OAuth consent page."""
+    redirect_uri = request.host_url.rstrip("/") + "/auth/callback"
+    url = get_auth_url(CREDENTIALS_FILE, redirect_uri)
+    if not url:
+        return "Missing credentials.json — download from Google Cloud Console and place in server/", 400
+    return redirect(url)
+
+
+@app.route("/auth/callback")
+def auth_callback():
+    """Google redirects here with ?code=... after user grants consent."""
+    code = request.args.get("code")
+    if not code:
+        return "Missing authorization code", 400
+    if handle_auth_callback(code, TOKEN_FILE):
+        print("[Auth] Google Calendar authenticated successfully")
+        return redirect("/")
+    return "Authentication failed — check server logs", 500
+
+
+# ---------------------------------------------------------------------------
+# API routes
+# ---------------------------------------------------------------------------
 
 
 @app.route("/api/settings", methods=["GET"])
@@ -540,6 +659,7 @@ def post_settings():
         save({
             "favorite_name": data.get("favorite_name", ""),
             "favorite_desc": data.get("favorite_desc", ""),
+            "event_duration": int(data.get("event_duration", DEFAULTS["event_duration"])),
             "event_labels": data.get("event_labels", DEFAULTS["event_labels"]),
         })
         if request.get_json() is not None:
@@ -575,47 +695,53 @@ def api_ping():
 
 @app.route("/api/trigger/repeat", methods=["POST"])
 def api_trigger_repeat():
-    sent = send_line("trigger_repeat")
-    if sent:
-        return jsonify({"sent": True, "ok": True, "message": "Trigger sent to ESP32"})
+    """Re-create the last activity as a new calendar event starting now."""
     if not _last_activity:
-        return jsonify({"sent": False, "ok": False, "error": "No previous activity to repeat"})
+        return jsonify({"ok": False, "error": "No previous activity to repeat"})
+    s = load()
+    dur = s.get("event_duration", DEFAULTS["event_duration"])
     try:
         result = handle_create_event(
             _last_activity["event_name"],
             _last_activity["transcript"],
-            30,
+            dur,
         )
-        return jsonify({"sent": False, "ok": result.get("ok"),
+        return jsonify({"ok": result.get("ok"),
                         "event_name": _last_activity["event_name"],
+                        "event_id": result.get("event_id", ""),
                         "error": result.get("error")})
     except Exception as e:
-        return jsonify({"sent": False, "ok": False, "error": str(e)})
+        return jsonify({"ok": False, "error": str(e)})
 
 
 @app.route("/api/trigger/favorite", methods=["POST"])
 def api_trigger_favorite():
-    sent = send_line("trigger_favorite")
-    if sent:
-        return jsonify({"sent": True, "ok": True, "message": "Trigger sent to ESP32"})
+    """Create a calendar event using the favorite name/desc from settings."""
+    s = load()
+    dur = s.get("event_duration", DEFAULTS["event_duration"])
+    name = s.get("favorite_name", "Focus Work")
+    desc = s.get("favorite_desc", "")
     try:
-        result = handle_create_favorite(30)
-        return jsonify({"sent": False, "ok": result.get("ok"), "error": result.get("error")})
+        result = handle_create_event(name, desc, dur)
+        return jsonify({"ok": result.get("ok"),
+                        "event_name": name,
+                        "event_id": result.get("event_id", ""),
+                        "error": result.get("error")})
     except Exception as e:
-        return jsonify({"sent": False, "ok": False, "error": str(e)})
+        return jsonify({"ok": False, "error": str(e)})
 
 
 # ---------------------------------------------------------------------------
-# Echo pipeline: browser → ESP32 → browser
+# Echo pipeline
 # ---------------------------------------------------------------------------
 
 
 @app.route("/api/record/send_to_esp32", methods=["POST"])
 def api_record_send_to_esp32():
-    """Receive audio from browser. Send to ESP32, wait for echo.
-    Then transcribe (STT) and interpret (LLM activity extraction).
-    Returns {ok, local, transcript, event_name, category}."""
+    """Record → echo → transcribe → interpret → create calendar event."""
     global _expecting_echo, _echo_audio, _echo_mime, _last_activity
+
+    from datetime import datetime, timedelta
 
     f = request.files.get("audio")
     if not f:
@@ -624,10 +750,20 @@ def api_record_send_to_esp32():
     if not audio_bytes:
         return jsonify({"ok": False, "error": "Empty audio"}), 400
 
+    # Parse the recording start time sent by the browser
+    start_time_str = request.form.get("start_time", "")
+    if start_time_str:
+        try:
+            record_start = datetime.fromisoformat(start_time_str.replace("Z", "+00:00"))
+            record_start = record_start.replace(tzinfo=None)
+        except ValueError:
+            record_start = datetime.utcnow()
+    else:
+        record_start = datetime.utcnow()
+
     mime = f.content_type or "audio/webm"
     local = False
 
-    # Prepare echo state BEFORE sending so serial thread sees the flag
     _echo_audio = b""
     _echo_mime = mime
     _echo_event.clear()
@@ -644,7 +780,7 @@ def api_record_send_to_esp32():
             _expecting_echo = False
             return jsonify({"ok": False, "error": "Timeout waiting for ESP32 echo (30s)"})
 
-    # --- STT: transcribe the echoed audio ---
+    # --- STT ---
     audio_for_stt = _echo_audio
     print(f"[STT] Transcribing {len(audio_for_stt)} bytes ({mime})...")
     tr = handle_transcribe_bytes(audio_for_stt, mime)
@@ -658,34 +794,45 @@ def api_record_send_to_esp32():
                         "event_name": "", "category": "",
                         "message": "No speech detected"})
 
-    # --- LLM: extract activity name from transcript ---
+    # --- LLM interpret ---
     print(f"[LLM] Interpreting: {transcript[:80]}")
     interp = handle_interpret(transcript)
     event_name = interp.get("event_name", transcript[:40])
     category = interp.get("category", "other")
 
     _last_activity = {"event_name": event_name, "transcript": transcript}
-    print(f"[Result] '{transcript}' -> {event_name} ({category})")
 
-    return jsonify({
+    # --- Create Google Calendar event starting at recording time ---
+    s = load()
+    dur = s.get("event_duration", DEFAULTS["event_duration"])
+    print(f"[Cal] Creating event '{event_name}' at {record_start.isoformat()} ({dur} min)")
+    cal = handle_create_event(event_name, transcript, dur, start=record_start)
+
+    result = {
         "ok": True,
         "local": local,
         "transcript": transcript,
         "event_name": event_name,
         "category": category,
-    })
+    }
+    if cal.get("ok"):
+        result["event_id"] = cal["event_id"]
+        print(f"[Cal] Created event {cal['event_id']}")
+    else:
+        result["cal_error"] = cal.get("error", "Calendar failed")
+        print(f"[Cal] Error: {result['cal_error']}")
+
+    return jsonify(result)
 
 
 @app.route("/api/audio/last")
 def api_audio_last():
-    """Serve the last echoed (or locally stored) audio for browser playback."""
     if not _echo_audio:
         return Response("No audio stored", status=404)
     return Response(_echo_audio, mimetype=_echo_mime or "audio/webm",
                     headers={"Cache-Control": "no-store"})
 
 
-# Keep /debug redirect for backwards compat
 @app.route("/debug")
 def debug_redirect():
     return redirect("/")
@@ -700,6 +847,11 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     no_serial = "--no-serial" in sys.argv
     port = args[0] if args else SERIAL_PORT
+
+    if is_authenticated(TOKEN_FILE):
+        print("[Auth] Google Calendar: authenticated")
+    else:
+        print("[Auth] Google Calendar: NOT authenticated — open http://localhost:5000 to authenticate")
 
     if not no_serial:
         t = threading.Thread(target=serial_loop, args=(port,), daemon=True)

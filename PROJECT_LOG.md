@@ -49,3 +49,38 @@ Conceptual notes on changes and project status.
 - `_last_activity` is stored for the Repeat button
 
 **Status**: Full pipeline: record → echo → transcribe → extract activity → display. Uses event_labels from Settings for LLM matching.
+
+## 2026-03-14 — Google Calendar OAuth in Web UI
+
+**Goal**: Authenticate with Google Calendar through the localhost web UI before any features are usable.
+
+**Changes**:
+- Rewrote `google_auth.py`: replaced `InstalledAppFlow.run_local_server()` with web-based `Flow` that integrates with Flask routes
+- Added `/auth/start` (redirects to Google consent), `/auth/callback` (exchanges code for token), `/api/auth/status` (returns auth state)
+- Auth banner at top of page: shows Authenticated (green) or Not Authenticated (red) with an Authenticate button
+- All features locked (`pointer-events: none`, grayed out) until Google OAuth is complete
+- `credentials.json` from Google Cloud Console required in server/ directory
+
+**Status**: Auth-gated UI. User must authenticate via the web page before using record/echo/calendar features.
+
+## 2026-03-14 — Auto Calendar Event Creation
+
+**Goal**: After STT + interpret, automatically create a 30-min Google Calendar event starting at the recording timestamp.
+
+**Changes**:
+- JS captures `new Date().toISOString()` when recording starts, sends as `start_time` form field
+- `handle_create_event` accepts optional `start` datetime (uses it instead of server "now")
+- Echo endpoint chains: echo → STT → interpret → create_event, returns `event_id`
+- LLM prompt updated: must use existing label if one matches, only invent a name if none fit
+
+**Status**: Full pipeline: record → echo → transcribe → match label → create 30-min calendar event at recording time.
+
+## 2026-03-14 — Repeat, Favorite, and Duration Setting
+
+**Changes**:
+- Repeat button creates a new calendar event using the last activity's name/transcript, starting at "now"
+- Favorite button creates a calendar event using the favorite name/desc from Settings, starting at "now"
+- New "Event duration (minutes)" setting — all events (record, repeat, favorite) use this value
+- Duration defaults to 30 min, configurable 5–480 in the UI
+
+**Status**: All three buttons (Record, Repeat, Favorite) create real Google Calendar events with configurable duration.

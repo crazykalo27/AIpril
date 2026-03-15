@@ -83,15 +83,16 @@ def handle_interpret(transcript: str) -> dict:
         return {"ok": True, "event_name": transcript[:40], "category": "other"}
 
 
-def handle_create_event(name: str, desc: str, duration_minutes: int = 30) -> dict:
-    """Create Google Calendar event. Uses server time."""
+def handle_create_event(name: str, desc: str, duration_minutes: int = 30,
+                        start: datetime | None = None) -> dict:
+    """Create Google Calendar event. Uses `start` if given, otherwise server time."""
     creds = get_credentials(CREDENTIALS_FILE, TOKEN_FILE)
     if not creds:
-        return {"ok": False, "error": "Google not authenticated. Run tools/google_auth_setup.py"}
+        return {"ok": False, "error": "Google not authenticated"}
 
-    now = datetime.utcnow()
-    start_dt = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_dt = (now + timedelta(minutes=duration_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    start_time = start or datetime.utcnow()
+    start_dt = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_dt = (start_time + timedelta(minutes=duration_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     event_id = create_calendar_event(creds, name, desc, start_dt, end_dt)
     if event_id:
