@@ -20,6 +20,7 @@ from flask import Flask, Response, jsonify, redirect, render_template_string, re
 from config import SERIAL_PORT, SERIAL_BAUD
 from handlers import (
     handle_transcribe,
+    handle_transcribe_bytes,
     handle_interpret,
     handle_create_event,
     handle_create_favorite,
@@ -64,13 +65,18 @@ def send_line(text: str) -> bool:
 
 
 def send_audio_to_esp32(audio_bytes: bytes) -> bool:
+    """Send audio to ESP32 in throttled chunks to avoid RX buffer overflow."""
     with _ser_lock:
         if not _ser or not _ser.is_open:
             return False
         header = f"AUDIO_PLAYBACK {len(audio_bytes)}\n"
         _ser.write(header.encode("utf-8"))
-        _ser.write(audio_bytes)
         _ser.flush()
+        time.sleep(0.05)
+        CHUNK = 1024
+        for i in range(0, len(audio_bytes), CHUNK):
+            _ser.write(audio_bytes[i:i + CHUNK])
+            _ser.flush()
         print(f"[Echo] Sent AUDIO_PLAYBACK ({len(audio_bytes)} bytes) to ESP32")
     return True
 
@@ -269,7 +275,7 @@ PAGE_HTML = """
     </div>
 
     <div id="result" class="empty">
-      Record audio, send to ESP32, hear the echo.
+      Record → ESP32 echo → transcribe → extract activity.
     </div>
 
     <audio id="audioPlayer" controls style="display:none;"></audio>
@@ -358,15 +364,27 @@ PAGE_HTML = """
       const fd = new FormData();
       fd.append('audio', blob, 'recording.webm');
 
-      setStatus('Sending to ESP32 for echo...');
+      setStatus('Sending to ESP32 for echo + transcription...');
+      log('Uploading audio...');
 
       try {
         const r = await fetch('/api/record/send_to_esp32', { method: 'POST', body: fd });
         const data = await r.json();
 
         if (data.ok) {
-          log(data.local ? 'No ESP32 — stored locally.' : 'ESP32 echoed ' + (data.bytes || '?') + ' bytes.');
-          setStatus('Playing back echoed audio...');
+          log(data.local ? 'No ESP32 — processed locally.' : 'ESP32 echo received.');
+
+          if (data.transcript) {
+            log('Transcript: ' + data.transcript);
+            log('Activity: ' + (data.event_name || '(none)') + ' (' + (data.category || '?') + ')');
+            setStatus(data.event_name
+              ? data.event_name + '  —  "' + data.transcript + '"'
+              : data.transcript);
+          } else {
+            setStatus(data.message || 'No speech detected.');
+            log(data.message || 'Empty transcript.');
+          }
+
           playLastAudio();
         } else {
           setStatus('Error: ' + (data.error || 'unknown'));
@@ -594,8 +612,10 @@ def api_trigger_favorite():
 
 @app.route("/api/record/send_to_esp32", methods=["POST"])
 def api_record_send_to_esp32():
-    """Receive audio from browser. Send to ESP32, wait for echo. Store result for playback."""
-    global _expecting_echo, _echo_audio, _echo_mime
+    """Receive audio from browser. Send to ESP32, wait for echo.
+    Then transcribe (STT) and interpret (LLM activity extraction).
+    Returns {ok, local, transcript, event_name, category}."""
+    global _expecting_echo, _echo_audio, _echo_mime, _last_activity
 
     f = request.files.get("audio")
     if not f:
@@ -605,6 +625,7 @@ def api_record_send_to_esp32():
         return jsonify({"ok": False, "error": "Empty audio"}), 400
 
     mime = f.content_type or "audio/webm"
+    local = False
 
     # Prepare echo state BEFORE sending so serial thread sees the flag
     _echo_audio = b""
@@ -613,19 +634,46 @@ def api_record_send_to_esp32():
     _expecting_echo = True
 
     if not send_audio_to_esp32(audio_bytes):
-        # No ESP32 — store the recording directly for local playback
         _expecting_echo = False
         _echo_audio = audio_bytes
         _echo_mime = mime
+        local = True
         print(f"[Echo] No ESP32, stored {len(audio_bytes)} bytes locally")
-        return jsonify({"ok": True, "local": True, "bytes": len(audio_bytes)})
+    else:
+        if not _echo_event.wait(timeout=30):
+            _expecting_echo = False
+            return jsonify({"ok": False, "error": "Timeout waiting for ESP32 echo (30s)"})
 
-    # Wait for ESP32 to echo the audio back
-    if not _echo_event.wait(timeout=30):
-        _expecting_echo = False
-        return jsonify({"ok": False, "error": "Timeout waiting for ESP32 echo (30s)"})
+    # --- STT: transcribe the echoed audio ---
+    audio_for_stt = _echo_audio
+    print(f"[STT] Transcribing {len(audio_for_stt)} bytes ({mime})...")
+    tr = handle_transcribe_bytes(audio_for_stt, mime)
+    if not tr.get("ok"):
+        return jsonify({"ok": False, "local": local, "error": tr.get("error", "STT failed"),
+                        "transcript": "", "event_name": ""})
 
-    return jsonify({"ok": True, "local": False, "bytes": len(_echo_audio)})
+    transcript = tr.get("transcript", "")
+    if not transcript:
+        return jsonify({"ok": True, "local": local, "transcript": "",
+                        "event_name": "", "category": "",
+                        "message": "No speech detected"})
+
+    # --- LLM: extract activity name from transcript ---
+    print(f"[LLM] Interpreting: {transcript[:80]}")
+    interp = handle_interpret(transcript)
+    event_name = interp.get("event_name", transcript[:40])
+    category = interp.get("category", "other")
+
+    _last_activity = {"event_name": event_name, "transcript": transcript}
+    print(f"[Result] '{transcript}' -> {event_name} ({category})")
+
+    return jsonify({
+        "ok": True,
+        "local": local,
+        "transcript": transcript,
+        "event_name": event_name,
+        "category": category,
+    })
 
 
 @app.route("/api/audio/last")

@@ -37,6 +37,23 @@ def handle_transcribe(audio_b64: str) -> dict:
     return {"ok": True, "transcript": text}
 
 
+def handle_transcribe_bytes(audio_bytes: bytes, content_type: str = "") -> dict:
+    """Transcribe raw audio bytes (webm, wav, etc.) via OpenAI."""
+    if not OPENAI_API_KEY:
+        return {"ok": False, "error": "OPENAI_API_KEY not set"}
+
+    ext = "webm" if "webm" in content_type else "wav"
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    with BytesIO(audio_bytes) as f:
+        f.name = f"recording.{ext}"
+        transcript = client.audio.transcriptions.create(
+            model=OPENAI_TRANSCRIBE_MODEL,
+            file=f,
+        )
+    text = transcript.text if transcript.text else ""
+    return {"ok": True, "transcript": text}
+
+
 def handle_interpret(transcript: str) -> dict:
     """Extract event name from transcript via GPT. Uses event_labels from settings."""
     if not OPENAI_API_KEY:

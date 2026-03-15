@@ -10,6 +10,7 @@
 AppController app;
 
 void setup() {
+    Serial.setRxBufferSize(4096);
     Serial.begin(115200);
     delay(1000);
     app.begin();

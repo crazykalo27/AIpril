@@ -37,3 +37,15 @@ Conceptual notes on changes and project status.
 - **Removed unnecessary local playback step**: JS no longer plays audio on laptop speakers before sending to ESP32.
 
 **Status**: Echo pipeline working. Browser records → ESP32 echoes → browser plays back. Falls back to local storage when no ESP32 connected.
+
+## 2026-03-14 — STT + LLM Activity Extraction
+
+**Goal**: After echo, transcribe the audio (OpenAI STT) and extract the activity name (GPT interpret).
+
+**Changes**:
+- Added `handle_transcribe_bytes` in handlers.py — accepts raw audio bytes instead of base64
+- Echo endpoint now chains: echo → STT → interpret, returns `{transcript, event_name, category}`
+- JS shows extracted activity and transcript in the result area
+- `_last_activity` is stored for the Repeat button
+
+**Status**: Full pipeline: record → echo → transcribe → extract activity → display. Uses event_labels from Settings for LLM matching.
