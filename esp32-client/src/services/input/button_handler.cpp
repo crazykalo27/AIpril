@@ -28,6 +28,12 @@ void ButtonHandler::begin() {
     _repeat.lastState   = digitalRead(_repeat.pin);
     _favorite.lastState = digitalRead(_favorite.pin);
 
+    Serial.printf("[Btn] voice(GPIO%d)=%s voice2(GPIO%d)=%s repeat(GPIO%d)=%s fav(GPIO%d)=%s\n",
+        _voice.pin,    _voice.lastState    ? "HIGH" : "LOW",
+        _voice2.pin,   _voice2.lastState   ? "HIGH" : "LOW",
+        _repeat.pin,   _repeat.lastState   ? "HIGH" : "LOW",
+        _favorite.pin, _favorite.lastState ? "HIGH" : "LOW");
+
     unsigned long now = millis();
     _voice.lastChange    = now;
     _voice2.lastChange   = now;
@@ -68,6 +74,9 @@ void ButtonHandler::readButton(Button& btn) {
         btn.lastState = state;
         if (state == LOW) {
             btn.pressed = true;
+            Serial.printf("[Btn] GPIO%d pressed\n", btn.pin);
+        } else {
+            Serial.printf("[Btn] GPIO%d released\n", btn.pin);
         }
     }
 }
