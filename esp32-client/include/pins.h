@@ -19,6 +19,7 @@
 
 // --- Buttons ---
 #define PIN_BTN_VOICE     0  // BOOT button on most ESP32 boards
+#define PIN_BTN_VOICE2   19  // Second voice/record button (to GND)
 #define PIN_BTN_REPEAT   25  // Pushbutton to GND (was 33)
 #define PIN_BTN_FAVORITE 14
 

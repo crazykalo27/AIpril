@@ -11,7 +11,7 @@
 
 AppController::AppController()
     : _buzzer(PIN_BUZZER)
-    , _buttons(PIN_BTN_VOICE, PIN_BTN_REPEAT, PIN_BTN_FAVORITE)
+    , _buttons(PIN_BTN_VOICE, PIN_BTN_VOICE2, PIN_BTN_REPEAT, PIN_BTN_FAVORITE)
     , _scheduler(PROMPT_INTERVAL_MS)
     , _reclaimDetector(RECLAIM_TAG)
     , _webServer(80)

@@ -12,14 +12,14 @@
 
 class ButtonHandler {
 public:
-    ButtonHandler(int voicePin, int repeatPin, int favoritePin);
+    ButtonHandler(int voicePin, int voice2Pin, int repeatPin, int favoritePin);
 
     void begin();
 
     /// Call every loop iteration. Reads pins and debounces.
     void update();
 
-    /// True once per press (cleared after read).
+    /// True once per press (cleared after read). Either voice button triggers this.
     bool wasVoicePressed();
     bool wasRepeatPressed();
     bool wasFavoritePressed();
@@ -37,6 +37,7 @@ private:
     void readButton(Button& btn);
 
     Button _voice;
+    Button _voice2;
     Button _repeat;
     Button _favorite;
 };

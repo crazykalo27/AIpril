@@ -149,3 +149,10 @@ Conceptual notes on changes and project status.
 - `HttpClient::update()` called every loop — retries register every 10s if not connected
 - Any HTTP failure sets `_registered = false`, triggering re-register
 - WiFi reconnect already existed in `main.cpp`; now server reconnect also handled
+
+## 2026-03-15 — Second Voice Button on GPIO 19
+
+**Changes**:
+- GPIO 19: INPUT_PULLUP, second voice/record button (to GND)
+- Either GPIO 0 (BOOT) or GPIO 19 triggers `handleVoiceCapture()`
+- Browser hold-to-record unchanged and works independently
